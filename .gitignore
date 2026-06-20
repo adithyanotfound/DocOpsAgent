@@ -1,0 +1,9 @@
+backend/.venv/
+backend/__pycache__/
+backend/app/**/__pycache__/
+backend/document_agent.db
+frontend/node_modules/
+frontend/dist/
+storage/
+.DS_Store
+.env
