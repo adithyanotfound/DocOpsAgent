@@ -1,12 +1,20 @@
 """LangGraph-based document agent workflow.
 
-Graph topology — apply_edits runs ONCE after the review loop:
+Graph topology — two-path architecture:
 
-  read_document → classify_retrieve → generate_edits → review
-                                            ↑                |
-                                            └─ (not done) ───┘
-                                                     ↓ (done)
-                                              apply_edits → END
+  EDIT MODE (targeted text changes):
+    read_document → classify_retrieve → generate_edits → review
+                                              ↑                |
+                                              └─ (not done) ───┘
+                                                       ↓ (done)
+                                                apply_edits → END
+
+  GENERATE MODE (template population / multi-slide creation):
+    read_document → classify_retrieve → plan_slides → review_plan
+                                              ↑                   |
+                                              └── (not done) ─────┘
+                                                        ↓ (done)
+                                                 apply_slide_plan → END
 
 "Done" means either: reviewer is satisfied, OR max iterations reached.
 Only ONE document version is created per user prompt, regardless of
@@ -30,6 +38,7 @@ from app.services.intent import IntentClassifier
 from app.services.preview import PreviewService
 from app.services.retrieval import RetrievalService
 from app.services.reviewer import Reviewer
+from app.services.slide_planner import SlidePlanner
 from app.services.storage import StorageService
 from app.services.websocket_manager import manager
 
@@ -52,9 +61,16 @@ class AgentState(TypedDict):
 
     chat_history: list[dict]
 
+    # Edit mode fields
     targets: list[dict]
     edits: list[dict]       # best edits so far (updated each iteration)
     review: dict
+
+    # Generate mode fields
+    mode: str               # "edit" or "generate"
+    intent: dict            # full intent classification result
+    template_structure: dict  # rich template structure for generation
+    slide_plan: dict        # structured slide plan from planner
 
     new_version_number: int | None
     thoughts: list[str]
@@ -78,6 +94,7 @@ class DocumentAgentGraph:
         self.processor = DocumentProcessor()
         self.editor = ContentEditor()
         self.reviewer = Reviewer()
+        self.planner = SlidePlanner()
         self.storage = StorageService()
         self.preview = PreviewService()
         self._graph = self._build()
@@ -89,25 +106,48 @@ class DocumentAgentGraph:
     def _build(self):
         workflow = StateGraph(AgentState)
 
+        # Shared nodes
         workflow.add_node("read_document",      self._read_document)
         workflow.add_node("classify_retrieve",  self._classify_retrieve)
+
+        # Edit mode nodes
         workflow.add_node("generate_edits",     self._generate_edits)
         workflow.add_node("review",             self._review)
-        workflow.add_node("apply_edits",        self._apply_edits)  # runs ONCE at end
+        workflow.add_node("apply_edits",        self._apply_edits)
+
+        # Generate mode nodes
+        workflow.add_node("plan_slides",        self._plan_slides)
+        workflow.add_node("review_plan",        self._review_plan)
+        workflow.add_node("apply_slide_plan",   self._apply_slide_plan)
 
         workflow.set_entry_point("read_document")
-        workflow.add_edge("read_document",     "classify_retrieve")
-        workflow.add_edge("classify_retrieve", "generate_edits")
-        workflow.add_edge("generate_edits",    "review")
+        workflow.add_edge("read_document", "classify_retrieve")
 
-        # After review: either refine (generate_edits) or commit (apply_edits).
+        # Branch after classification based on mode
         workflow.add_conditional_edges(
-            "review",
-            self._should_continue,
-            {"refine": "generate_edits", "commit": "apply_edits"},
+            "classify_retrieve",
+            self._route_by_mode,
+            {"edit": "generate_edits", "generate": "plan_slides"},
         )
 
+        # Edit mode flow
+        workflow.add_edge("generate_edits", "review")
+        workflow.add_conditional_edges(
+            "review",
+            self._should_continue_edit,
+            {"refine": "generate_edits", "commit": "apply_edits"},
+        )
         workflow.add_edge("apply_edits", END)
+
+        # Generate mode flow
+        workflow.add_edge("plan_slides", "review_plan")
+        workflow.add_conditional_edges(
+            "review_plan",
+            self._should_continue_generate,
+            {"refine": "plan_slides", "commit": "apply_slide_plan"},
+        )
+        workflow.add_edge("apply_slide_plan", END)
+
         return workflow.compile()
 
     # ------------------------------------------------------------------
@@ -161,6 +201,10 @@ class DocumentAgentGraph:
             "targets": [],
             "edits": [],
             "review": {},
+            "mode": "edit",  # default, overridden in classify_retrieve
+            "intent": {},
+            "template_structure": {},
+            "slide_plan": {},
             "new_version_number": None,
             "thoughts": [],
             "satisfied": False,
@@ -192,24 +236,41 @@ class DocumentAgentGraph:
     # ------------------------------------------------------------------
 
     async def _finalise(self, workspace_id: str, run: AgentRun, state: AgentState) -> None:
-        count = len(state["edits"])
+        mode = state.get("mode", "edit")
         version_num = state["new_version_number"]
         review = state["review"]
 
-        if count == 0 or not version_num:
-            summary_text = "I could not find matching editable content for that request."
-        elif review.get("satisfied"):
-            summary_text = (
-                f"The requested changes have been applied across "
-                f"{count} text block{'s' if count != 1 else ''}."
-            )
+        if mode == "generate":
+            slide_plan = state.get("slide_plan", {})
+            active_slides = [
+                s for s in slide_plan.get("slides", [])
+                if s.get("action") != "delete"
+            ]
+            count = len(active_slides)
+
+            if count == 0 or not version_num:
+                summary_text = "I could not generate presentation content for that request."
+            else:
+                summary_text = (
+                    f"Created a {count}-slide presentation. "
+                    f"The content has been generated and formatted based on your request."
+                )
         else:
-            summary_text = (
-                f"I applied the best changes I could across "
-                f"{count} text block{'s' if count != 1 else ''} "
-                f"(ran {state['iteration']} refinement round{'s' if state['iteration'] != 1 else ''}). "
-                "Feel free to ask for further adjustments."
-            )
+            count = len(state["edits"])
+            if count == 0 or not version_num:
+                summary_text = "I could not find matching editable content for that request."
+            elif review.get("satisfied"):
+                summary_text = (
+                    f"The requested changes have been applied across "
+                    f"{count} text block{'s' if count != 1 else ''}."
+                )
+            else:
+                summary_text = (
+                    f"I applied the best changes I could across "
+                    f"{count} text block{'s' if count != 1 else ''} "
+                    f"(ran {state['iteration']} refinement round{'s' if state['iteration'] != 1 else ''}). "
+                    "Feel free to ask for further adjustments."
+                )
 
         version_label = state["original_request"][:50].rstrip()
         content = json.dumps({
@@ -228,20 +289,31 @@ class DocumentAgentGraph:
         await manager.send(workspace_id, {"type": "completed", "version": version_num})
 
     # ------------------------------------------------------------------
-    # Conditional edge: refine or commit?
+    # Routing edges
     # ------------------------------------------------------------------
 
-    def _should_continue(self, state: AgentState) -> str:
-        # Satisfied after this round → commit.
+    def _route_by_mode(self, state: AgentState) -> str:
+        return state.get("mode", "edit")
+
+    def _should_continue_edit(self, state: AgentState) -> str:
+        """Edit mode: refine or commit?"""
         if state["satisfied"]:
             return "commit"
-        # No edits produced → nothing to refine, commit what we have.
         if not state["edits"]:
             return "commit"
-        # Reached iteration limit → commit best version.
         if state["iteration"] >= MAX_ITERATIONS:
             return "commit"
-        # Otherwise, try another refinement round.
+        return "refine"
+
+    def _should_continue_generate(self, state: AgentState) -> str:
+        """Generate mode: refine or commit?"""
+        if state["satisfied"]:
+            return "commit"
+        plan = state.get("slide_plan", {})
+        if not plan.get("slides"):
+            return "commit"
+        if state["iteration"] >= MAX_ITERATIONS:
+            return "commit"
         return "refine"
 
     # ------------------------------------------------------------------
@@ -258,12 +330,38 @@ class DocumentAgentGraph:
     # ------------------------------------------------------------------
 
     async def _classify_retrieve(self, state: AgentState) -> dict:
-        thought = "Classifying your request to identify which parts of the document to edit."
+        thought = "Classifying your request to determine the best approach."
         await self._thought(state, thought)
 
         intent = self.intent.classify(state["request"], state["chat_history"])
         structure = state["structure"]
         document_type = state["document_type"]
+        mode = intent.get("mode", "edit")
+
+        if mode == "generate" and document_type == "pptx":
+            # Generation mode — extract rich template structure
+            thought2 = f"Detected generation request. Analysing template structure for content planning."
+            await self._thought(state, thought2)
+
+            template_structure = self.processor.extract_rich(
+                state["source_document_path"], document_type
+            )
+
+            return {
+                "mode": "generate",
+                "intent": intent,
+                "template_structure": template_structure,
+                "thoughts": state["thoughts"] + [thought, thought2],
+            }
+
+        # Edit mode — existing behaviour
+        if mode == "generate" and document_type != "pptx":
+            thought2 = "Generation mode is only supported for PPTX files. Falling back to edit mode."
+            await self._thought(state, thought2)
+            mode = "edit"
+        else:
+            thought2 = "Identified edit mode — locating target content."
+            await self._thought(state, thought2)
 
         if intent["direct_target"] and document_type == "pptx" and intent["slide"]:
             targets = [
@@ -283,19 +381,21 @@ class DocumentAgentGraph:
             targets = self.retrieval.retrieve(query, structure)
             target_desc = f"{len(targets)} block(s) via semantic search"
 
-        thought2 = (
+        thought3 = (
             f"No matching content found." if not targets
             else f"Found {len(targets)} text block(s) to edit ({target_desc})."
         )
-        await self._thought(state, thought2)
+        await self._thought(state, thought3)
 
         return {
+            "mode": "edit",
+            "intent": intent,
             "targets": targets,
-            "thoughts": state["thoughts"] + [thought, thought2],
+            "thoughts": state["thoughts"] + [thought, thought2, thought3],
         }
 
     # ------------------------------------------------------------------
-    # Node: generate_edits  (may run multiple times)
+    # Node: generate_edits  (edit mode, may run multiple times)
     # ------------------------------------------------------------------
 
     async def _generate_edits(self, state: AgentState) -> dict:
@@ -310,8 +410,9 @@ class DocumentAgentGraph:
             )
         await self._thought(state, thought)
 
-        edits = [
-            {
+        edits = []
+        for block in state["targets"]:
+            edits.append({
                 "element_id": block["element_id"],
                 "old_text": block["text"],
                 "new_text": self.editor.rewrite(
@@ -320,9 +421,7 @@ class DocumentAgentGraph:
                     block.get("metadata", {}),
                     state["chat_history"]
                 ),
-            }
-            for block in state["targets"]
-        ]
+            })
 
         changed = sum(1 for e in edits if e["old_text"] != e["new_text"])
         thought2 = f"Produced {changed} change(s) across {len(edits)} block(s)."
@@ -334,7 +433,7 @@ class DocumentAgentGraph:
         }
 
     # ------------------------------------------------------------------
-    # Node: review  (may run multiple times — no file I/O)
+    # Node: review  (edit mode, may run multiple times — no file I/O)
     # ------------------------------------------------------------------
 
     async def _review(self, state: AgentState) -> dict:
@@ -371,7 +470,7 @@ class DocumentAgentGraph:
         }
 
     # ------------------------------------------------------------------
-    # Node: apply_edits  (runs ONCE at the end of the loop)
+    # Node: apply_edits  (edit mode, runs ONCE at the end)
     # ------------------------------------------------------------------
 
     async def _apply_edits(self, state: AgentState) -> dict:
@@ -421,6 +520,143 @@ class DocumentAgentGraph:
         await self._thought(state, thought2)
 
         # Tell the frontend a new version is ready.
+        await manager.send(workspace_id, {
+            "type": "version_created",
+            "version_number": new_version,
+            "pdf_url": pdf_url,
+            "document_url": doc_url,
+        })
+
+        return {
+            "new_version_number": new_version,
+            "thoughts": state["thoughts"] + [thought, thought2],
+        }
+
+    # ------------------------------------------------------------------
+    # Node: plan_slides  (generate mode, may run multiple times)
+    # ------------------------------------------------------------------
+
+    async def _plan_slides(self, state: AgentState) -> dict:
+        iteration = state["iteration"]
+        if iteration == 0:
+            thought = "Planning slide content and layout for your presentation."
+        else:
+            feedback = state["review"].get("feedback", "no specific feedback")
+            thought = (
+                f"Refinement round {iteration}/{MAX_ITERATIONS}: "
+                f"Improving slide plan based on feedback — {feedback}"
+            )
+        await self._thought(state, thought)
+
+        slide_plan = self.planner.plan(
+            request=state["request"],
+            template_structure=state["template_structure"],
+            intent=state["intent"],
+            chat_history=state["chat_history"],
+        )
+
+        active_count = len([
+            s for s in slide_plan.get("slides", [])
+            if s.get("action") != "delete"
+        ])
+        thought2 = f"Generated a plan with {active_count} slide(s)."
+        await self._thought(state, thought2)
+
+        return {
+            "slide_plan": slide_plan,
+            "thoughts": state["thoughts"] + [thought, thought2],
+        }
+
+    # ------------------------------------------------------------------
+    # Node: review_plan  (generate mode)
+    # ------------------------------------------------------------------
+
+    async def _review_plan(self, state: AgentState) -> dict:
+        thought = "Reviewing the slide plan for quality and completeness."
+        await self._thought(state, thought)
+
+        review = self.reviewer.review_plan(
+            state["original_request"], state["slide_plan"], state["intent"]
+        )
+
+        if review["satisfied"]:
+            thought2 = "✓ The slide plan looks good — proceeding to apply."
+        else:
+            next_iter = state["iteration"] + 1
+            if next_iter >= MAX_ITERATIONS:
+                thought2 = (
+                    f"Max refinement rounds ({MAX_ITERATIONS}) reached. "
+                    "Will apply the current plan."
+                )
+            else:
+                feedback = review.get("feedback", "")
+                thought2 = f"Plan feedback: {feedback or 'could be improved'} — refining."
+
+        await self._thought(state, thought2)
+
+        augmented = state["request"]
+        if not review["satisfied"] and review.get("feedback"):
+            augmented = f"{state['request']}\nReviewer feedback: {review['feedback']}"
+
+        return {
+            "review": review,
+            "satisfied": review["satisfied"],
+            "iteration": state["iteration"] + 1,
+            "request": augmented,
+            "thoughts": state["thoughts"] + [thought, thought2],
+        }
+
+    # ------------------------------------------------------------------
+    # Node: apply_slide_plan  (generate mode, runs ONCE at the end)
+    # ------------------------------------------------------------------
+
+    async def _apply_slide_plan(self, state: AgentState) -> dict:
+        workspace_id = state["workspace_id"]
+        workspace = self.repo.get(workspace_id)
+        slide_plan = state.get("slide_plan", {})
+
+        if not slide_plan.get("slides"):
+            thought = "No slide plan to apply — the document is unchanged."
+            await self._thought(state, thought)
+            return {"thoughts": state["thoughts"] + [thought]}
+
+        thought = "Building the presentation from the slide plan and generating a PDF preview."
+        await self._thought(state, thought)
+
+        new_version = state["latest_version_number"] + 1
+        document_path = self.storage.version_document_path(
+            workspace_id, new_version, "pptx"
+        )
+
+        self.processor.apply_slide_plan(
+            source=state["source_document_path"],
+            target=document_path,
+            slide_plan=slide_plan,
+        )
+
+        pdf_path = self.storage.version_pdf_path(workspace_id, new_version)
+        self.preview.convert_to_pdf(document_path, pdf_path)
+        new_structure = self.processor.extract(document_path, "pptx")
+
+        workspace.current_version = new_version
+        self.db.add(DocumentVersion(
+            workspace_id=workspace_id,
+            version_number=new_version,
+            document_path=str(document_path),
+            pdf_path=str(pdf_path),
+        ))
+        self.db.add(DocumentStructure(
+            workspace_id=workspace_id,
+            version_number=new_version,
+            structure_json=new_structure,
+        ))
+        self.db.commit()
+
+        pdf_url  = f"/api/files/{workspace_id}/v{new_version}.pdf"
+        doc_url  = f"/api/files/{workspace_id}/v{new_version}.pptx"
+        thought2 = f"Version {new_version} saved — {len([s for s in slide_plan['slides'] if s.get('action') != 'delete'])} slides created with PDF preview."
+        await self._thought(state, thought2)
+
         await manager.send(workspace_id, {
             "type": "version_created",
             "version_number": new_version,

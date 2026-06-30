@@ -114,10 +114,10 @@ export function ChatPanel({ workspace }: Props) {
             <button
               key={v.id}
               className={`h-7 border-2 border-ink px-2.5 text-xs font-bold transition-colors hover:bg-accent ${
-                v.version_number === workspace.current_version ? "bg-accent" : "bg-paper"
+                (pinnedVersion === v.version_number) || (!pinnedVersion && v.version_number === workspace.current_version) ? "bg-accent" : "bg-paper"
               }`}
-              onClick={() => rollbackMutation.mutate(v.version_number)}
-              title={`Restore version ${v.version_number}`}
+              onClick={() => setPinnedVersion(v.version_number)}
+              title={`Preview version ${v.version_number}`}
             >
               v{v.version_number}
             </button>
@@ -129,6 +129,18 @@ export function ChatPanel({ workspace }: Props) {
           >
             <RotateCcw size={12} className="mx-auto" />
           </button>
+          {pinnedVersion !== null && pinnedVersion !== workspace.current_version && (
+            <button
+              className="ml-auto flex h-7 items-center justify-center border-2 border-ink bg-paper px-2.5 text-xs font-bold hover:bg-accent"
+              title={`Rollback to version ${pinnedVersion}`}
+              onClick={() => {
+                rollbackMutation.mutate(pinnedVersion);
+                setPinnedVersion(null);
+              }}
+            >
+              Rollback to v{pinnedVersion}
+            </button>
+          )}
         </div>
       </div>
 

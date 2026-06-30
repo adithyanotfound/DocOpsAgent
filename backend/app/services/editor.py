@@ -33,15 +33,19 @@ class ContentEditor:
             base_url=settings.openai_base_url or None,
         )
         system_prompt = (
-            "You are a precise document editing assistant. "
-            "You will be given an editing instruction, a specific text block from a document, "
-            "and its metadata (such as slide number, paragraph index, or section heading).\n\n"
+            "You are a precise document editing assistant evaluating ONE specific text block at a time.\n"
+            "You will be given an editing instruction, the text block itself, and its metadata.\n\n"
             "IMPORTANT RULES:\n"
-            "1. Only rewrite the text if it is DIRECTLY relevant to the instruction.\n"
-            "2. If the text block is NOT related to the instruction (e.g. the instruction targets a "
-            "different topic, section, or slide), return the original text EXACTLY as-is.\n"
-            "3. Never add, remove, or change content that is out of scope of the instruction.\n"
-            "4. Return ONLY the (possibly rewritten) text — no commentary, no markdown, no quotes."
+            "1. You must decide if the provided text block is the INTENDED TARGET of the instruction.\n"
+            "2. If the user asks to edit a 'title', 'heading', or 'topic', you MUST ASSUME the provided text block IS the target and rewrite it, UNLESS the text block is obviously a footer, slide number (like `‹#›` or a plain digit), or a specific field label (like `Theme Name:`).\n"
+            "3. If you decide the text block IS the target, return ONLY the new rewritten text.\n"
+            "4. If you decide the text block is NOT the target, you MUST return the ORIGINAL TEXT EXACTLY AS-IS. Do not return any other text.\n"
+            "5. Provide no commentary, markdown, or quotes.\n"
+            "6. For formatting-related instructions (e.g. 'make it bold', 'center align', 'change font size'), "
+            "you cannot change formatting directly — only change the TEXT content. Return the text as-is if the "
+            "instruction is purely about formatting.\n"
+            "7. When writing content, ensure it is professional, well-structured, and compelling. "
+            "Use bullet points (•) for lists when appropriate."
         )
         
         meta_str = json.dumps(metadata) if metadata else "None"
@@ -59,8 +63,7 @@ class ContentEditor:
             f"{history_str}"
             f"Editing instruction: {request}\n\n"
             f"Text block to consider:\n{text}\n\n"
-            f"Block metadata: {meta_str}\n\n"
-            "Return the rewritten text if relevant, or the original text unchanged if not relevant."
+            f"Block metadata: {meta_str}"
         )
         response = client.chat.completions.create(
             model=settings.llm_model,
@@ -122,3 +125,4 @@ class ContentEditor:
         updated = re.sub(r"\s{2,}", " ", updated)
         updated = re.sub(r"\s+([,.!?])", r"\1", updated)
         return updated.strip()
+
