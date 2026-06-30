@@ -103,6 +103,25 @@ def get_file(workspace_id: str, filename: str) -> FileResponse:
     return FileResponse(path)
 
 
+@router.get("/source-files/{workspace_id}/{filename}")
+def get_source_file(workspace_id: str, filename: str) -> FileResponse:
+    """
+    Serve source .docx/.pptx files so OnlyOffice can fetch them during conversion.
+    OnlyOffice pulls files by URL — this endpoint is that URL.
+    """
+    from app.core.config import settings
+
+    path = (settings.storage_root / workspace_id / filename).resolve()
+    storage = settings.storage_root.resolve()
+
+    # Safety: only serve files inside storage_root
+    if not str(path).startswith(str(storage)):
+        raise HTTPException(status_code=403, detail="Access denied")
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="File not found")
+    return FileResponse(path)
+
+
 @router.websocket("/workspaces/{workspace_id}/ws")
 async def workspace_ws(websocket: WebSocket, workspace_id: str) -> None:
     await manager.connect(workspace_id, websocket)

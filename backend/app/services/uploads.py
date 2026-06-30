@@ -30,7 +30,7 @@ class UploadService:
                 handle.write(chunk)
 
         pdf_path = self.storage.version_pdf_path(workspace.id, 1)
-        self.preview.convert_to_pdf(document_path, pdf_path)
+        await self.preview.convert_to_pdf(document_path, pdf_path)
         structure = self.processor.extract(document_path, document_type)
 
         self.db.add(

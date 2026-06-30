@@ -497,7 +497,7 @@ class DocumentAgentGraph:
         )
 
         pdf_path = self.storage.version_pdf_path(workspace_id, new_version)
-        self.preview.convert_to_pdf(document_path, pdf_path)
+        await self.preview.convert_to_pdf(document_path, pdf_path)
         new_structure = self.processor.extract(document_path, state["document_type"])
 
         workspace.current_version = new_version
@@ -635,7 +635,7 @@ class DocumentAgentGraph:
         )
 
         pdf_path = self.storage.version_pdf_path(workspace_id, new_version)
-        self.preview.convert_to_pdf(document_path, pdf_path)
+        await self.preview.convert_to_pdf(document_path, pdf_path)
         new_structure = self.processor.extract(document_path, "pptx")
 
         workspace.current_version = new_version

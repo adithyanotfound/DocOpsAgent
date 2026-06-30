@@ -1,11 +1,14 @@
 services:
-  converter:
-    build:
-      context: ./converter
+  onlyoffice:
+    image: onlyoffice/documentserver:latest
     ports:
-      - "8081:8080"
+      - "8083:80"
+    environment:
+      - JWT_ENABLED=false
+      - ALLOW_PRIVATE_IP_ADDRESS=true
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health').read()"]
-      interval: 10s
-      timeout: 5s
+      test: ["CMD", "curl", "-f", "http://localhost/healthcheck"]
+      interval: 30s
+      timeout: 10s
       retries: 5
+      start_period: 60s
