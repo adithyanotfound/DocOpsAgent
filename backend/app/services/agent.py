@@ -9,5 +9,5 @@ class DocumentAgent:
     def __init__(self, db: Session) -> None:
         self._graph = DocumentAgentGraph(db)
 
-    async def run(self, workspace_id: str, request: str) -> AgentRun:
-        return await self._graph.run(workspace_id, request)
+    async def run(self, workspace_id: str, request: str, attached_image_path: str | None = None) -> AgentRun:
+        return await self._graph.run(workspace_id, request, attached_image_path=attached_image_path)

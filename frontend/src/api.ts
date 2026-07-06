@@ -37,12 +37,17 @@ export async function deleteWorkspace(id: string): Promise<void> {
   }
 }
 
-export async function sendChat(workspaceId: string, content: string): Promise<void> {
+export async function sendChat(workspaceId: string, content: string, image?: File): Promise<void> {
+  const form = new FormData();
+  form.append("content", content);
+  if (image) {
+    form.append("image", image);
+  }
   await parse(
     await fetch(`${API_BASE}/api/workspaces/${workspaceId}/chat`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ content })
+      body: form,
+      // Do NOT set Content-Type; browser will set multipart boundary automatically
     })
   );
 }

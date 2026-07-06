@@ -1,5 +1,15 @@
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { ChevronDown, ChevronRight, FileText, RotateCcw, Send } from "lucide-react";
+import {
+  AlertCircle,
+  ChevronDown,
+  ChevronRight,
+  FileText,
+  Image as ImageIcon,
+  Paperclip,
+  RotateCcw,
+  Send,
+  X,
+} from "lucide-react";
 import { FormEvent, useEffect, useRef, useState } from "react";
 import { rollback, sendChat } from "../api";
 import { useAppStore } from "../store";
@@ -29,7 +39,10 @@ export function ChatPanel({ workspace }: Props) {
 
   const queryClient = useQueryClient();
   const [draft, setDraft] = useState("");
+  const [attachedImage, setAttachedImage] = useState<File | null>(null);
+  const [imagePreview, setImagePreview] = useState<string | null>(null);
   const bottomRef = useRef<HTMLDivElement | null>(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   // ---- WebSocket ------------------------------------------------------
   useEffect(() => {
@@ -54,8 +67,6 @@ export function ChatPanel({ workspace }: Props) {
       }
 
       if (event.type === "completed" || event.type === "error") {
-        // Await the refetch so the new message is in the cache BEFORE
-        // the loading bubble disappears.
         await queryClient.refetchQueries({ queryKey: ["workspace", workspace.id] });
         await queryClient.refetchQueries({ queryKey: ["workspaces"] });
         endAgentRun();
@@ -70,19 +81,37 @@ export function ChatPanel({ workspace }: Props) {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [workspace.messages, liveThoughts, liveUserMessage, isAgentRunning]);
 
+  // ---- Image attachment -----------------------------------------------
+  function onAttachClick() {
+    fileInputRef.current?.click();
+  }
+
+  function onFileChange(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setAttachedImage(file);
+    const reader = new FileReader();
+    reader.onload = () => setImagePreview(reader.result as string);
+    reader.readAsDataURL(file);
+    // Reset input so the same file can be re-selected
+    e.target.value = "";
+  }
+
+  function removeAttachment() {
+    setAttachedImage(null);
+    setImagePreview(null);
+  }
+
   // ---- Chat mutation -------------------------------------------------
   const chatMutation = useMutation({
-    mutationFn: (content: string) => sendChat(workspace.id, content),
-    onMutate: (content) => startAgentRun(content),
+    mutationFn: ({ content, image }: { content: string; image?: File }) =>
+      sendChat(workspace.id, content, image),
+    onMutate: ({ content }) => startAgentRun(content),
     onSuccess: async () => {
-      // Fallback: The POST request waits for the agent to finish. 
-      // If we missed the WebSocket "completed" event, we catch up here.
       await queryClient.refetchQueries({ queryKey: ["workspace", workspace.id] });
       await queryClient.refetchQueries({ queryKey: ["workspaces"] });
     },
     onSettled: () => {
-      // Safety net: always stop the spinner when the request finishes,
-      // regardless of success, failure, or WebSocket state.
       endAgentRun();
     },
   });
@@ -99,13 +128,25 @@ export function ChatPanel({ workspace }: Props) {
     e.preventDefault();
     const content = draft.trim();
     if (!content || isAgentRunning) return;
+    const img = attachedImage ?? undefined;
     setDraft("");
-    chatMutation.mutate(content);
+    setAttachedImage(null);
+    setImagePreview(null);
+    chatMutation.mutate({ content, image: img });
   }
 
   // ---- Render --------------------------------------------------------
   return (
     <div className="flex min-h-0 flex-1 flex-col">
+      {/* Hidden file input */}
+      <input
+        ref={fileInputRef}
+        type="file"
+        accept="image/png,image/jpeg,image/webp,image/svg+xml,image/gif"
+        className="hidden"
+        onChange={onFileChange}
+      />
+
       {/* Version pills + refresh */}
       <div className="border-b-2 border-ink px-5 py-3">
         <p className="truncate text-xs font-bold text-ink/60 mb-2">{workspace.original_filename}</p>
@@ -114,7 +155,10 @@ export function ChatPanel({ workspace }: Props) {
             <button
               key={v.id}
               className={`h-7 border-2 border-ink px-2.5 text-xs font-bold transition-colors hover:bg-accent ${
-                (pinnedVersion === v.version_number) || (!pinnedVersion && v.version_number === workspace.current_version) ? "bg-accent" : "bg-paper"
+                (pinnedVersion === v.version_number) ||
+                (!pinnedVersion && v.version_number === workspace.current_version)
+                  ? "bg-accent"
+                  : "bg-paper"
               }`}
               onClick={() => setPinnedVersion(v.version_number)}
               title={`Preview version ${v.version_number}`}
@@ -149,7 +193,7 @@ export function ChatPanel({ workspace }: Props) {
         <div className="flex flex-col gap-4">
           {workspace.messages.map((message) => {
             if (message.role === "user") {
-              return <UserBubble key={message.id} content={message.content} />;
+              return <UserBubble key={message.id} content={message.content} imageUrl={message.image_url} />;
             }
             return (
               <AgentBubble
@@ -161,9 +205,12 @@ export function ChatPanel({ workspace }: Props) {
             );
           })}
 
-          {/* Optimistically rendered user message */}
+          {/* Optimistically rendered user message (with attached image if any) */}
           {isAgentRunning && liveUserMessage && (
-            <UserBubble content={liveUserMessage} />
+            <UserBubble
+              content={liveUserMessage}
+              imageUrl={imagePreview ?? undefined}
+            />
           )}
 
           {/* Live in-progress bubble */}
@@ -178,30 +225,108 @@ export function ChatPanel({ workspace }: Props) {
         <div ref={bottomRef} />
       </div>
 
-      {/* Input */}
-      <form onSubmit={onSubmit} className="flex gap-2 border-t-2 border-ink p-4">
-        <textarea
-          className="min-h-20 flex-1 resize-none border-2 border-ink bg-paper p-3 text-sm font-medium outline-none focus:bg-accent/30 transition-colors"
-          value={draft}
-          placeholder="Ask the agent to edit the document…"
-          disabled={isAgentRunning}
-          onChange={(e) => setDraft(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === "Enter" && !e.shiftKey) {
-              e.preventDefault();
-              onSubmit(e as unknown as FormEvent);
+      {/* Image preview strip */}
+      {imagePreview && (
+        <div className="border-t-2 border-ink/20 bg-ink/5 px-4 py-2 flex items-center gap-3">
+          <div className="relative w-16 h-16 flex-shrink-0">
+            <img
+              src={imagePreview}
+              alt="Attachment preview"
+              className="w-16 h-16 object-cover border-2 border-ink/30"
+            />
+            <button
+              type="button"
+              className="absolute -top-1.5 -right-1.5 flex h-5 w-5 items-center justify-center rounded-full bg-ink text-paper hover:bg-ink/70 transition-colors"
+              onClick={removeAttachment}
+              title="Remove attachment"
+            >
+              <X size={10} />
+            </button>
+          </div>
+          <div className="flex flex-col min-w-0">
+            <span className="text-xs font-semibold text-ink truncate">{attachedImage?.name}</span>
+            <span className="text-xs text-ink/50">
+              {attachedImage ? (attachedImage.size / 1024).toFixed(1) + " KB" : ""}
+            </span>
+          </div>
+        </div>
+      )}
+
+      {/* Input area */}
+      <form onSubmit={onSubmit} className="flex flex-col gap-0 border-t-2 border-ink">
+        <div className="flex gap-2 p-4">
+          <textarea
+            className="min-h-20 flex-1 resize-none border-2 border-ink bg-paper p-3 text-sm font-medium outline-none focus:bg-accent/30 transition-colors"
+            value={draft}
+            placeholder={
+              attachedImage
+                ? "Describe what you'd like to do with this image…"
+                : "Ask the agent to edit the document… (attach an image with 📎)"
             }
-          }}
-        />
-        <button
-          className="flex w-12 items-center justify-center border-2 border-ink bg-accent disabled:opacity-40"
-          title="Send"
-          disabled={isAgentRunning || !draft.trim()}
-        >
-          <Send size={18} />
-        </button>
+            disabled={isAgentRunning}
+            onChange={(e) => setDraft(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && !e.shiftKey) {
+                e.preventDefault();
+                onSubmit(e as unknown as FormEvent);
+              }
+            }}
+          />
+          <div className="flex flex-col gap-2">
+            <button
+              type="button"
+              className={`flex h-10 w-10 items-center justify-center border-2 border-ink transition-colors ${
+                attachedImage
+                  ? "bg-accent border-accent/80"
+                  : "bg-paper hover:bg-accent/40"
+              }`}
+              title="Attach an image"
+              onClick={onAttachClick}
+              disabled={isAgentRunning}
+            >
+              <Paperclip size={16} className={attachedImage ? "text-ink" : "text-ink/60"} />
+            </button>
+            <button
+              type="submit"
+              className="flex flex-1 min-h-10 w-10 items-center justify-center border-2 border-ink bg-accent disabled:opacity-40"
+              title="Send"
+              disabled={isAgentRunning || !draft.trim()}
+            >
+              <Send size={18} />
+            </button>
+          </div>
+        </div>
+
       </form>
     </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Quick-action chip button
+// ---------------------------------------------------------------------------
+
+function QuickActionChip({
+  label,
+  prompt,
+  disabled,
+  onSelect,
+}: {
+  label: string;
+  prompt: string;
+  disabled: boolean;
+  onSelect: (prompt: string) => void;
+}) {
+  return (
+    <button
+      type="button"
+      className="h-6 px-2.5 border border-ink/20 bg-paper text-xs font-medium text-ink/60 hover:bg-accent/40 hover:text-ink hover:border-ink/40 transition-all disabled:opacity-40"
+      disabled={disabled}
+      onClick={() => onSelect(prompt)}
+      title={prompt}
+    >
+      {label}
+    </button>
   );
 }
 
@@ -209,11 +334,22 @@ export function ChatPanel({ workspace }: Props) {
 // User message bubble
 // ---------------------------------------------------------------------------
 
-function UserBubble({ content }: { content: string }) {
+function UserBubble({ content, imageUrl }: { content: string; imageUrl?: string }) {
   return (
     <div className="flex justify-end">
-      <div className="max-w-[85%] rounded-2xl rounded-tr-sm bg-ink px-4 py-3 text-paper text-sm font-medium shadow-sm">
-        {content}
+      <div className="flex flex-col items-end gap-2 max-w-[85%]">
+        {imageUrl && (
+          <div className="border-2 border-ink/30 overflow-hidden rounded-sm">
+            <img
+              src={imageUrl}
+              alt="Attached image"
+              className="max-w-48 max-h-48 object-cover"
+            />
+          </div>
+        )}
+        <div className="rounded-2xl rounded-tr-sm bg-ink px-4 py-3 text-paper text-sm font-medium shadow-sm">
+          {content}
+        </div>
       </div>
     </div>
   );
@@ -233,10 +369,19 @@ function AgentBubble({
   onVersionClick: (v: number) => void;
 }) {
   if (!content) {
-    // Plain text (e.g. "Document uploaded and indexed.")
     return (
       <div className="flex justify-start">
         <div className="max-w-[85%] text-sm text-ink/70 font-medium py-1">{rawContent}</div>
+      </div>
+    );
+  }
+
+  // Special "needs image" card
+  if (content.needs_image) {
+    return (
+      <div className="flex flex-col gap-2">
+        {content.thoughts.length > 0 && <ThinkingBlock thoughts={content.thoughts} />}
+        <NeedsImageCard message={content.text} />
       </div>
     );
   }
@@ -255,6 +400,28 @@ function AgentBubble({
       )}
       <div className="flex justify-start">
         <p className="max-w-[85%] text-sm text-ink leading-relaxed">{content.text}</p>
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Needs-image prompt card
+// ---------------------------------------------------------------------------
+
+function NeedsImageCard({ message }: { message: string }) {
+  return (
+    <div className="flex justify-start">
+      <div className="flex max-w-[85%] items-start gap-3 border-2 border-amber-400/60 bg-amber-50/60 px-4 py-3">
+        <AlertCircle size={16} className="shrink-0 text-amber-500 mt-0.5" />
+        <div className="flex flex-col gap-1">
+          <p className="text-sm font-semibold text-ink">Image Required</p>
+          <p className="text-sm text-ink/70 leading-relaxed">{message}</p>
+          <div className="mt-1 flex items-center gap-1.5 text-xs text-ink/50">
+            <ImageIcon size={12} />
+            <span>Click the 📎 paperclip icon to attach your image</span>
+          </div>
+        </div>
       </div>
     </div>
   );

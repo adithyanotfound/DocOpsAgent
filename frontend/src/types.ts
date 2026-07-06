@@ -4,6 +4,7 @@ export type AgentContent = {
   text: string;
   version_number: number | null;
   version_label: string | null;
+  needs_image?: boolean;
 };
 
 export type Message = {
@@ -11,6 +12,7 @@ export type Message = {
   role: "user" | "assistant";
   content: string;
   content_parsed: AgentContent | null;
+  image_url?: string;
   created_at: string;
 };
 

@@ -35,6 +35,7 @@ from app.repositories import WorkspaceRepository
 from app.services.document_processor import DocumentProcessor
 from app.services.editor import ContentEditor
 from app.services.intent import IntentClassifier
+from app.services.operation_generator import OperationGenerator
 from app.services.preview import PreviewService
 from app.services.retrieval import RetrievalService
 from app.services.reviewer import Reviewer
@@ -61,16 +62,25 @@ class AgentState(TypedDict):
 
     chat_history: list[dict]
 
+    # Attached image (for image_op)
+    attached_image_path: str | None
+
     # Edit mode fields
     targets: list[dict]
     edits: list[dict]       # best edits so far (updated each iteration)
     review: dict
 
     # Generate mode fields
-    mode: str               # "edit" or "generate"
+    mode: str               # "edit" | "generate" | "operations"
     intent: dict            # full intent classification result
     template_structure: dict  # rich template structure for generation
     slide_plan: dict        # structured slide plan from planner
+
+    # Operations mode fields
+    operations: list[dict]   # structured operation list
+    op_summaries: list[str]  # human-readable summaries of applied ops
+    needs_image: bool        # True when agent is asking for an image
+    needs_image_message: str # Message to show when needs_image is True
 
     new_version_number: int | None
     thoughts: list[str]
@@ -95,6 +105,7 @@ class DocumentAgentGraph:
         self.editor = ContentEditor()
         self.reviewer = Reviewer()
         self.planner = SlidePlanner()
+        self.op_generator = OperationGenerator()
         self.storage = StorageService()
         self.preview = PreviewService()
         self._graph = self._build()
@@ -120,6 +131,11 @@ class DocumentAgentGraph:
         workflow.add_node("review_plan",        self._review_plan)
         workflow.add_node("apply_slide_plan",   self._apply_slide_plan)
 
+        # Operations mode nodes (new)
+        workflow.add_node("generate_operations", self._generate_operations)
+        workflow.add_node("review_operations",   self._review_operations)
+        workflow.add_node("apply_operations",    self._apply_operations)
+
         workflow.set_entry_point("read_document")
         workflow.add_edge("read_document", "classify_retrieve")
 
@@ -127,7 +143,7 @@ class DocumentAgentGraph:
         workflow.add_conditional_edges(
             "classify_retrieve",
             self._route_by_mode,
-            {"edit": "generate_edits", "generate": "plan_slides"},
+            {"edit": "generate_edits", "generate": "plan_slides", "operations": "generate_operations"},
         )
 
         # Edit mode flow
@@ -148,13 +164,22 @@ class DocumentAgentGraph:
         )
         workflow.add_edge("apply_slide_plan", END)
 
+        # Operations mode flow
+        workflow.add_edge("generate_operations", "review_operations")
+        workflow.add_conditional_edges(
+            "review_operations",
+            self._should_continue_operations,
+            {"refine": "generate_operations", "commit": "apply_operations"},
+        )
+        workflow.add_edge("apply_operations", END)
+
         return workflow.compile()
 
     # ------------------------------------------------------------------
     # Public entry point
     # ------------------------------------------------------------------
 
-    async def run(self, workspace_id: str, request: str) -> AgentRun:
+    async def run(self, workspace_id: str, request: str, attached_image_path: str | None = None) -> AgentRun:
         workspace = self.repo.get(workspace_id)
         if workspace is None:
             raise ValueError("Workspace not found")
@@ -198,6 +223,7 @@ class DocumentAgentGraph:
             "source_document_path": current_doc.document_path if current_doc else latest.document_path,
             "structure": structure_row.structure_json,
             "chat_history": chat_history,
+            "attached_image_path": attached_image_path,
             "targets": [],
             "edits": [],
             "review": {},
@@ -205,6 +231,10 @@ class DocumentAgentGraph:
             "intent": {},
             "template_structure": {},
             "slide_plan": {},
+            "operations": [],
+            "op_summaries": [],
+            "needs_image": False,
+            "needs_image_message": "",
             "new_version_number": None,
             "thoughts": [],
             "satisfied": False,
@@ -224,6 +254,7 @@ class DocumentAgentGraph:
                 "text": f"The agent encountered an error: {error_msg}",
                 "version_number": None,
                 "version_label": None,
+                "needs_image": False,
             })
             self.db.add(Message(workspace_id=workspace_id, role="assistant", content=content))
             self.db.commit()
@@ -240,7 +271,43 @@ class DocumentAgentGraph:
         version_num = state["new_version_number"]
         review = state["review"]
 
-        if mode == "generate":
+        # --- needs_image: no document change, just ask for attachment ---
+        if state.get("needs_image"):
+            msg = state.get("needs_image_message") or (
+                "To insert an image, please attach it to your next message "
+                "using the 📎 paperclip icon below the chat input."
+            )
+            content = json.dumps({
+                "type": "agent_response",
+                "thoughts": state["thoughts"],
+                "text": msg,
+                "version_number": None,
+                "version_label": None,
+                "needs_image": True,
+            })
+            run.status = "completed"
+            run.completed_at = datetime.utcnow()
+            self.db.add(Message(workspace_id=workspace_id, role="assistant", content=content))
+            self.db.commit()
+            await manager.send(workspace_id, {"type": "completed", "version": None})
+            return
+
+        # --- Operations mode summary ---
+        if mode == "operations":
+            summaries = state.get("op_summaries", [])
+            if not summaries or not version_num:
+                summary_text = (
+                    "I wasn't able to apply that change to the document. "
+                    "Please try rephrasing your request or providing more detail "
+                    "(e.g. which slide, shape, or element to target)."
+                )
+            else:
+                ops_desc = "; ".join(summaries[:5])
+                if len(summaries) > 5:
+                    ops_desc += f" … and {len(summaries) - 5} more"
+                summary_text = f"Done! Applied {len(summaries)} operation(s): {ops_desc}."
+
+        elif mode == "generate":
             slide_plan = state.get("slide_plan", {})
             active_slides = [
                 s for s in slide_plan.get("slides", [])
@@ -279,6 +346,7 @@ class DocumentAgentGraph:
             "text": summary_text,
             "version_number": version_num,
             "version_label": version_label,
+            "needs_image": False,
         })
 
         run.status = "completed"
@@ -307,12 +375,19 @@ class DocumentAgentGraph:
 
     def _should_continue_generate(self, state: AgentState) -> str:
         """Generate mode: refine or commit?"""
-        if state["satisfied"]:
+        if state.get("satisfied"):
             return "commit"
         plan = state.get("slide_plan", {})
         if not plan.get("slides"):
             return "commit"
         if state["iteration"] >= MAX_ITERATIONS:
+            return "commit"
+        return "refine"
+
+    def _should_continue_operations(self, state: AgentState) -> str:
+        if state["iteration"] >= MAX_ITERATIONS:
+            return "commit"
+        if state.get("reviewer_satisfied", True):
             return "commit"
         return "refine"
 
@@ -388,7 +463,7 @@ class DocumentAgentGraph:
         await self._thought(state, thought3)
 
         return {
-            "mode": "edit",
+            "mode": mode,
             "intent": intent,
             "targets": targets,
             "thoughts": state["thoughts"] + [thought, thought2, thought3],
@@ -499,6 +574,11 @@ class DocumentAgentGraph:
         pdf_path = self.storage.version_pdf_path(workspace_id, new_version)
         await self.preview.convert_to_pdf(document_path, pdf_path)
         new_structure = self.processor.extract(document_path, state["document_type"])
+
+        import json
+        json_path = document_path.with_suffix(".json")
+        with json_path.open("w", encoding="utf-8") as f:
+            json.dump(new_structure, f, indent=2)
 
         workspace.current_version = new_version
         self.db.add(DocumentVersion(
@@ -670,6 +750,155 @@ class DocumentAgentGraph:
         }
 
     # ------------------------------------------------------------------
+    # Node: generate_operations  (operations mode, runs once)
+    # ------------------------------------------------------------------
+
+    async def _generate_operations(self, state: AgentState) -> dict:
+        thought = "Analysing your request and building a list of document operations."
+        await self._thought(state, thought)
+
+        ops = self.op_generator.generate(
+            request=state["request"],
+            structure=state["structure"],
+            document_type=state["document_type"],
+            chat_history=state["chat_history"],
+            intent=state["intent"],
+            attached_image_path=state.get("attached_image_path"),
+            previous_ops=state.get("operations"),
+            reviewer_feedback=state.get("reviewer_feedback"),
+        )
+
+        # Increment iteration if operations were already generated previously
+        iteration = state.get("iteration", 1)
+        if state.get("operations"):
+            iteration += 1
+
+        # Check for needs_image signal
+        needs_image_ops = [o for o in ops if o.get("op_type") == "needs_image"]
+        if needs_image_ops:
+            msg = needs_image_ops[0].get("parameters", {}).get("message", "")
+            thought2 = "No image attached — asking user to provide one."
+            await self._thought(state, thought2)
+            return {
+                "operations": ops,
+                "needs_image": True,
+                "needs_image_message": msg,
+                "thoughts": state["thoughts"] + [thought, thought2],
+            }
+
+        thought2 = f"Prepared {len(ops)} operation(s) to execute."
+        await self._thought(state, thought2)
+
+        return {
+            "operations": ops,
+            "needs_image": False,
+            "iteration": iteration,
+            "thoughts": state["thoughts"] + [thought, thought2],
+        }
+
+    # ------------------------------------------------------------------
+    # Node: review_operations
+    # ------------------------------------------------------------------
+
+    async def _review_operations(self, state: AgentState) -> dict:
+        # If we need an image, just skip review
+        if state.get("needs_image"):
+            return {"reviewer_satisfied": True, "reviewer_feedback": ""}
+
+        thought = "Verifying that the generated operations fulfill all your instructions."
+        await self._thought(state, thought)
+
+        review = self.reviewer.review_operations(
+            request=state["request"],
+            ops=state["operations"],
+        )
+
+        satisfied = review["satisfied"]
+        feedback = review["feedback"]
+
+        if satisfied:
+            thought2 = "All requested operations appear correctly implemented."
+        else:
+            thought2 = f"I missed some details. Refining operations. Feedback: {feedback}"
+
+        await self._thought(state, thought2)
+
+        return {
+            "reviewer_satisfied": satisfied,
+            "reviewer_feedback": feedback,
+            "thoughts": state["thoughts"] + [thought, thought2],
+        }
+
+    # ------------------------------------------------------------------
+    # Node: apply_operations  (operations mode, runs once at the end)
+    # ------------------------------------------------------------------
+
+    async def _apply_operations(self, state: AgentState) -> dict:
+        workspace_id = state["workspace_id"]
+        workspace = self.repo.get(workspace_id)
+
+        # If we need an image, skip applying (finalise will send the message)
+        if state.get("needs_image"):
+            return {"thoughts": state["thoughts"]}
+
+        ops = state.get("operations", [])
+        if not ops:
+            thought = "No operations to apply — the document is unchanged."
+            await self._thought(state, thought)
+            return {"thoughts": state["thoughts"] + [thought]}
+
+        thought = f"Applying {len(ops)} operation(s) to the document."
+        await self._thought(state, thought)
+
+        new_version = state["latest_version_number"] + 1
+        document_path = self.storage.version_document_path(
+            workspace_id, new_version, state["document_type"]
+        )
+        from pathlib import Path
+        changed, summaries = self.processor.apply_operations(
+            source=Path(state["source_document_path"]),
+            target=document_path,
+            document_type=state["document_type"],
+            operations=ops,
+        )
+
+        pdf_path = self.storage.version_pdf_path(workspace_id, new_version)
+        await self.preview.convert_to_pdf(document_path, pdf_path)
+        new_structure = self.processor.extract(document_path, state["document_type"])
+
+        workspace.current_version = new_version
+        self.db.add(DocumentVersion(
+            workspace_id=workspace_id,
+            version_number=new_version,
+            document_path=str(document_path),
+            pdf_path=str(pdf_path),
+        ))
+        self.db.add(DocumentStructure(
+            workspace_id=workspace_id,
+            version_number=new_version,
+            structure_json=new_structure,
+        ))
+        self.db.commit()
+
+        pdf_url = f"/api/files/{workspace_id}/v{new_version}.pdf"
+        doc_url = f"/api/files/{workspace_id}/v{new_version}.{state['document_type']}"
+        thought2 = f"Version {new_version} saved — {len(summaries)} operation(s) applied."
+        await self._thought(state, thought2)
+
+        await manager.send(workspace_id, {
+            "type": "version_created",
+            "version_number": new_version,
+            "pdf_url": pdf_url,
+            "document_url": doc_url,
+        })
+
+        return {
+            "new_version_number": new_version,
+            "op_summaries": summaries,
+            "thoughts": state["thoughts"] + [thought, thought2],
+        }
+
+    # ------------------------------------------------------------------
     # Utility
     # ------------------------------------------------------------------
 
@@ -679,3 +908,4 @@ class DocumentAgentGraph:
             "content": content,
             "iteration": state["iteration"],
         })
+

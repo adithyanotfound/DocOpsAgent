@@ -1,13 +1,13 @@
 import shutil
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 
 from app.db.session import get_db
 from app.repositories import WorkspaceRepository
-from app.schemas import ChatRequest, ChatResponse, WorkspaceOut
+from app.schemas import ChatResponse, WorkspaceOut
 from app.services.agent import DocumentAgent
 from app.services.serializers import serialize_workspace
 from app.services.uploads import UploadService
@@ -48,11 +48,38 @@ def get_workspace(workspace_id: str, db: Session = Depends(get_db)) -> Workspace
 
 
 @router.post("/workspaces/{workspace_id}/chat", response_model=ChatResponse)
-async def chat(workspace_id: str, payload: ChatRequest, db: Session = Depends(get_db)) -> ChatResponse:
+async def chat(
+    workspace_id: str,
+    content: str = Form(...),
+    image: UploadFile | None = File(None),
+    db: Session = Depends(get_db),
+) -> ChatResponse:
+    from app.core.config import settings
+
     repo = WorkspaceRepository(db)
     if not repo.get(workspace_id):
         raise HTTPException(status_code=404, detail="Workspace not found")
-    run = await DocumentAgent(db).run(workspace_id, payload.content)
+
+    # Save attached image if present
+    attached_image_path: str | None = None
+    if image and image.filename:
+        suffix = Path(image.filename).suffix.lower()
+        if suffix not in {".png", ".jpg", ".jpeg", ".webp", ".svg", ".gif", ".bmp"}:
+            raise HTTPException(
+                status_code=400,
+                detail="Unsupported image type. Please attach PNG, JPG, WEBP, or SVG."
+            )
+        uploads_dir = settings.storage_root / workspace_id / "uploads"
+        uploads_dir.mkdir(parents=True, exist_ok=True)
+        # Use a timestamp-based filename to avoid collisions
+        import time
+        safe_name = f"{int(time.time() * 1000)}{suffix}"
+        dest = uploads_dir / safe_name
+        with dest.open("wb") as f:
+            shutil.copyfileobj(image.file, f)
+        attached_image_path = str(dest)
+
+    run = await DocumentAgent(db).run(workspace_id, content, attached_image_path=attached_image_path)
     return ChatResponse(run_id=run.id, status=run.status)
 
 
