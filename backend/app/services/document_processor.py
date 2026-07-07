@@ -146,7 +146,8 @@ class DocumentProcessor:
                     "metadata": {
                         "role": n.get("role"),
                         "colors": list(colors),
-                        "fonts": list(fonts)
+                        "fonts": list(fonts),
+                        "include_in_toc": n.get("include_in_toc")
                     }
                 })
             for child in n.get("children", []) + n.get("rows", []) + n.get("cells", []):
@@ -1129,34 +1130,50 @@ class DocumentProcessor:
             start_id = params.get("start_id")
             end_id = params.get("end_id")
             before_id = params.get("before_id")
-            if not start_id or not end_id or not before_id:
-                return "move_block requires start_id, end_id, and before_id"
+            after_id = params.get("after_id")
+            if not start_id or not end_id or not (before_id or after_id):
+                return "move_block requires start_id, end_id, and either before_id or after_id"
 
             body_index = self._build_docx_body_index(doc)
             id_to_pos = {eid: i for i, (eid, _) in enumerate(body_index)}
 
             start_pos = id_to_pos.get(start_id, -1)
             end_pos = id_to_pos.get(end_id, -1)
-            before_pos = id_to_pos.get(before_id, -1)
+            before_pos = id_to_pos.get(before_id, -1) if before_id else -1
+            after_pos = id_to_pos.get(after_id, -1) if after_id else -1
 
-            if start_pos == -1 or end_pos == -1 or before_pos == -1:
-                missing = [i for i, p in [(start_id, start_pos), (end_id, end_pos), (before_id, before_pos)] if p == -1]
+            if start_pos == -1 or end_pos == -1 or (before_id and before_pos == -1) or (after_id and after_pos == -1):
+                missing = []
+                if start_pos == -1: missing.append(("start_id", start_id))
+                if end_pos == -1: missing.append(("end_id", end_id))
+                if before_id and before_pos == -1: missing.append(("before_id", before_id))
+                if after_id and after_pos == -1: missing.append(("after_id", after_id))
                 return f"Failed to find required block boundaries: {missing}. Available IDs: {[eid for eid, _ in body_index[:30]]}"
 
             if start_pos > end_pos:
                 start_pos, end_pos = end_pos, start_pos
 
+            if start_pos <= before_pos <= end_pos or start_pos <= after_pos <= end_pos:
+                return f"Moved {end_pos - start_pos + 1} block(s) (no-op because target is inside the moved block)"
+
             # Collect the xml elements to move
             elements_to_move = [body_index[i][1] for i in range(start_pos, end_pos + 1)]
-            before_xml_el = body_index[before_pos][1]
 
-            # Remove from current position, then insert before target
+            # Remove from current position
             for xml_el in elements_to_move:
                 xml_el.getparent().remove(xml_el)
-            for xml_el in elements_to_move:
-                before_xml_el.addprevious(xml_el)
-
-            return f"Moved {len(elements_to_move)} block(s) ('{start_id}'→'{end_id}') before '{before_id}'"
+                
+            # Insert at new position
+            if before_pos != -1:
+                before_xml_el = body_index[before_pos][1]
+                for xml_el in elements_to_move:
+                    before_xml_el.addprevious(xml_el)
+                return f"Moved {len(elements_to_move)} block(s) ('{start_id}'→'{end_id}') before '{before_id}'"
+            elif after_pos != -1:
+                after_xml_el = body_index[after_pos][1]
+                for xml_el in reversed(elements_to_move):
+                    after_xml_el.addnext(xml_el)
+                return f"Moved {len(elements_to_move)} block(s) ('{start_id}'→'{end_id}') after '{after_id}'"
 
         elif action == "insert_page_break":
             before_id = params.get("before_id")
@@ -1182,6 +1199,262 @@ class DocumentProcessor:
             p.append(r)
             before_xml_el.addprevious(p)
             return f"Inserted page break before '{before_id}'"
+
+        elif action == "remove_block":
+            start_id = params.get("start_id")
+            end_id = params.get("end_id")
+            if not start_id or not end_id:
+                return "remove_block requires start_id and end_id"
+
+            body_index = self._build_docx_body_index(doc)
+            id_to_pos = {eid: i for i, (eid, _) in enumerate(body_index)}
+
+            start_pos = id_to_pos.get(start_id, -1)
+            end_pos = id_to_pos.get(end_id, -1)
+
+            if start_pos == -1 or end_pos == -1:
+                return f"Failed to find block boundaries. start={start_pos}, end={end_pos}"
+
+            if start_pos > end_pos:
+                start_pos, end_pos = end_pos, start_pos
+
+            elements = [body_index[i][1] for i in range(start_pos, end_pos + 1)]
+            for xml_el in elements:
+                xml_el.getparent().remove(xml_el)
+            return f"Removed {len(elements)} block(s) ('{start_id}'→'{end_id}')"
+
+        elif action == "duplicate_block":
+            start_id = params.get("start_id")
+            end_id = params.get("end_id")
+            before_id = params.get("before_id")
+            after_id = params.get("after_id")
+            
+            if not start_id or not end_id or (not before_id and not after_id):
+                return "duplicate_block requires start_id, end_id, and either before_id or after_id"
+
+            body_index = self._build_docx_body_index(doc)
+            id_to_pos = {eid: i for i, (eid, _) in enumerate(body_index)}
+
+            start_pos = id_to_pos.get(start_id, -1)
+            end_pos = id_to_pos.get(end_id, -1)
+            
+            target_xml_el = None
+            insert_before = True
+            if before_id:
+                pos = id_to_pos.get(before_id, -1)
+                if pos != -1:
+                    target_xml_el = body_index[pos][1]
+            elif after_id:
+                pos = id_to_pos.get(after_id, -1)
+                if pos != -1:
+                    target_xml_el = body_index[pos][1]
+                    insert_before = False
+
+            if start_pos == -1 or end_pos == -1 or target_xml_el is None:
+                return "Failed to find block boundaries or target id for duplicate_block"
+
+            if start_pos > end_pos:
+                start_pos, end_pos = end_pos, start_pos
+
+            elements = [body_index[i][1] for i in range(start_pos, end_pos + 1)]
+            import copy
+            cloned_elements = [copy.deepcopy(el) for el in elements]
+            
+            current_target = target_xml_el
+            for xml_el in cloned_elements:
+                if insert_before:
+                    current_target.addprevious(xml_el)
+                else:
+                    current_target.addnext(xml_el)
+                    current_target = xml_el
+            
+            return f"Duplicated {len(elements)} block(s) ('{start_id}'→'{end_id}')"
+
+        elif action == "insert_block":
+            before_id = params.get("before_id")
+            after_id = params.get("after_id")
+            data = params.get("data", [])
+            
+            if not data or (not before_id and not after_id):
+                return "insert_block requires data array and either before_id or after_id"
+
+            body_index = self._build_docx_body_index(doc)
+            id_to_pos = {eid: i for i, (eid, _) in enumerate(body_index)}
+
+            target_xml_el = None
+            insert_before = True
+            if before_id:
+                pos = id_to_pos.get(before_id, -1)
+                if pos != -1:
+                    target_xml_el = body_index[pos][1]
+            elif after_id:
+                pos = id_to_pos.get(after_id, -1)
+                if pos != -1:
+                    target_xml_el = body_index[pos][1]
+                    insert_before = False
+
+            if target_xml_el is None:
+                return "Failed to find target id for insert_block"
+
+            # Create paragraphs / tables from data and collect XML elements
+            new_elements = []
+            for item in data:
+                text = item.get("text", "")
+                role = item.get("role", "body")
+
+                if role == "heading":
+                    lvl = item.get("heading_level", 1)
+                    p = doc.add_heading(text, level=lvl)
+                    xml_el = p._p
+                    xml_el.getparent().remove(xml_el)
+                    new_elements.append(xml_el)
+
+                elif role == "bullet_point":
+                    from docx.oxml import OxmlElement as _OXe
+                    from docx.oxml.ns import qn as _qne
+                    try:
+                        p = doc.add_paragraph(text, style="List Paragraph")
+                    except Exception:
+                        p = doc.add_paragraph(text)
+                    pPr = p._p.get_or_add_pPr()
+                    numPr = _OXe("w:numPr")
+                    ilvl = _OXe("w:ilvl"); ilvl.set(_qne("w:val"), "0")
+                    numId_el = _OXe("w:numId"); numId_el.set(_qne("w:val"), "1")
+                    numPr.append(ilvl); numPr.append(numId_el)
+                    pPr.append(numPr)
+                    xml_el = p._p
+                    xml_el.getparent().remove(xml_el)
+                    new_elements.append(xml_el)
+
+                elif role == "table":
+                    # Inline table with headers + rows (used by ToC enricher etc.)
+                    headers = item.get("headers", [])
+                    rows = item.get("rows", [])
+                    style_hint = item.get("style", "")
+                    num_cols = max(
+                        len(headers),
+                        max((len(r) for r in rows), default=0),
+                        1,
+                    )
+                    tbl = doc.add_table(rows=1 + len(rows), cols=num_cols)
+                    tbl_xml = tbl._tbl
+                    tbl_xml.getparent().remove(tbl_xml)
+
+                    from docx.oxml.ns import qn as _qnt
+                    from docx.oxml import OxmlElement as _OXt
+
+                    def _cell_text(cell, val: str, bold: bool = False) -> None:
+                        cell.text = str(val)
+                        if bold:
+                            for run in cell.paragraphs[0].runs:
+                                run.bold = True
+
+                    # Header row
+                    hdr_row = tbl.rows[0]
+                    for ci, hdr in enumerate(headers[:num_cols]):
+                        _cell_text(hdr_row.cells[ci], hdr, bold=True)
+
+                    # Data rows
+                    for ri, row_data in enumerate(rows):
+                        tbl_row = tbl.rows[ri + 1]
+                        for ci, cell_val in enumerate(row_data[:num_cols]):
+                            _cell_text(tbl_row.cells[ci], cell_val)
+
+                    # ToC style: remove all borders for a clean look
+                    if style_hint == "toc":
+                        tblPr = tbl_xml.find(_qnt("w:tblPr"))
+                        if tblPr is None:
+                            tblPr = _OXt("w:tblPr")
+                            tbl_xml.insert(0, tblPr)
+                        tblBorders = _OXt("w:tblBorders")
+                        for bname in ("top", "left", "bottom", "right", "insideH", "insideV"):
+                            b = _OXt(f"w:{bname}")
+                            b.set(_qnt("w:val"), "none")
+                            tblBorders.append(b)
+                        existing = tblPr.find(_qnt("w:tblBorders"))
+                        if existing is not None:
+                            tblPr.remove(existing)
+                        tblPr.append(tblBorders)
+
+                    new_elements.append(tbl_xml)
+
+                else:
+                    # Default: plain body paragraph with optional bold
+                    p = doc.add_paragraph(text)
+                    if item.get("bold"):
+                        for run in p.runs:
+                            run.bold = True
+                    xml_el = p._p
+                    xml_el.getparent().remove(xml_el)
+                    new_elements.append(xml_el)
+
+            current_target = target_xml_el
+            for xml_el in new_elements:
+                if insert_before:
+                    current_target.addprevious(xml_el)
+                else:
+                    current_target.addnext(xml_el)
+                    current_target = xml_el
+
+            return f"Inserted {len(new_elements)} new block(s)"
+
+        elif action == "insert_toc":
+            before_id = params.get("before_id")
+            after_id = params.get("after_id")
+            
+            if not before_id and not after_id:
+                return "insert_toc requires before_id or after_id"
+
+            body_index = self._build_docx_body_index(doc)
+            id_to_pos = {eid: i for i, (eid, _) in enumerate(body_index)}
+
+            target_xml_el = None
+            insert_before = True
+            if before_id:
+                pos = id_to_pos.get(before_id, -1)
+                if pos != -1:
+                    target_xml_el = body_index[pos][1]
+            elif after_id:
+                pos = id_to_pos.get(after_id, -1)
+                if pos != -1:
+                    target_xml_el = body_index[pos][1]
+                    insert_before = False
+
+            if target_xml_el is None:
+                return "Failed to find target id for insert_toc"
+
+            from docx.oxml import parse_xml
+            from docx.oxml.ns import nsdecls
+            
+            toc_xml = f"""
+            <w:sdt {nsdecls('w')}>
+              <w:sdtPr>
+                <w:docPartObj>
+                  <w:docPartGallery w:val="Table of Contents"/>
+                  <w:docPartUnique/>
+                </w:docPartObj>
+              </w:sdtPr>
+              <w:sdtContent>
+                <w:p>
+                  <w:pPr><w:pStyle w:val="TOCHeading"/></w:pPr>
+                  <w:r><w:t>Table of Contents</w:t></w:r>
+                </w:p>
+                <w:p>
+                  <w:r><w:fldChar w:fldCharType="begin"/></w:r>
+                  <w:r><w:instrText xml:space="preserve"> TOC \\o "1-3" \\h \\z \\u </w:instrText></w:r>
+                  <w:r><w:fldChar w:fldCharType="separate"/></w:r>
+                </w:p>
+                <w:p><w:r><w:fldChar w:fldCharType="end"/></w:r></w:p>
+              </w:sdtContent>
+            </w:sdt>
+            """
+            toc_elem = parse_xml(toc_xml)
+            if insert_before:
+                target_xml_el.addprevious(toc_elem)
+            else:
+                target_xml_el.addnext(toc_elem)
+                
+            return "Inserted Table of Contents"
 
         return ""
 
@@ -2328,29 +2601,56 @@ class DocumentProcessor:
             if role != match_role:
                 return False
                 
-        alignment = params.get("alignment")
-        if alignment:
-            from docx.enum.text import WD_ALIGN_PARAGRAPH
-            align_map = {
-                "left": WD_ALIGN_PARAGRAPH.LEFT,
-                "center": WD_ALIGN_PARAGRAPH.CENTER,
-                "right": WD_ALIGN_PARAGRAPH.RIGHT,
-                "justify": WD_ALIGN_PARAGRAPH.JUSTIFY,
-            }
-            if alignment in align_map:
-                para.alignment = align_map[alignment]
+        match_text = params.get("match_text")
+        if not match_text:
+            alignment = params.get("alignment")
+            if alignment:
+                from docx.enum.text import WD_ALIGN_PARAGRAPH
+                align_map = {
+                    "left": WD_ALIGN_PARAGRAPH.LEFT,
+                    "center": WD_ALIGN_PARAGRAPH.CENTER,
+                    "right": WD_ALIGN_PARAGRAPH.RIGHT,
+                    "justify": WD_ALIGN_PARAGRAPH.JUSTIFY,
+                }
+                if alignment in align_map:
+                    para.alignment = align_map[alignment]
+
+            line_spacing = params.get("line_spacing")
+            if line_spacing is not None:
+                para.paragraph_format.line_spacing = float(line_spacing)
+
+            page_break_before = params.get("page_break_before")
+            if page_break_before is not None:
+                para.paragraph_format.page_break_before = bool(page_break_before)
+
+            space_before = params.get("space_before_pt")
+            if space_before is not None:
+                from docx.shared import Pt
+                para.paragraph_format.space_before = Pt(float(space_before))
+
+            space_after = params.get("space_after_pt")
+            if space_after is not None:
+                from docx.shared import Pt
+                para.paragraph_format.space_after = Pt(float(space_after))
+
+            include_in_toc = params.get("include_in_toc")
+            if include_in_toc is not None:
+                from docx.oxml.ns import qn as _qn
+                from docx.oxml import OxmlElement
+                pPr = para._p.get_or_add_pPr()
+                outlineLvl = pPr.find(_qn('w:outlineLvl'))
+                if include_in_toc is False:
+                    if outlineLvl is None:
+                        outlineLvl = OxmlElement('w:outlineLvl')
+                        pPr.append(outlineLvl)
+                    outlineLvl.set(_qn('w:val'), '9')
+                else:
+                    if outlineLvl is not None:
+                        pPr.remove(outlineLvl)
 
         # Normalise color_hex: strip '#' prefix so both "FF0000" and "#FF0000" work
         raw_color = params.get("color_hex", "")
         color_hex = str(raw_color).strip().lstrip("#").upper() if raw_color else ""
-
-        line_spacing = params.get("line_spacing")
-        if line_spacing is not None:
-            para.paragraph_format.line_spacing = float(line_spacing)
-
-        page_break_before = params.get("page_break_before")
-        if page_break_before is not None:
-            para.paragraph_format.page_break_before = bool(page_break_before)
 
         runs = para.runs
         # If the paragraph has no runs but has text, create one to hold the formatting
@@ -2369,7 +2669,6 @@ class DocumentProcessor:
                             pass
             runs = para.runs
 
-        match_text = params.get("match_text")
         if match_text:
             return self._apply_run_aware_format(para, match_text, params)
                 
@@ -2547,6 +2846,36 @@ class DocumentProcessor:
                     summaries.append(f"Merged cells in table {t_idx}")
                 except Exception as e:
                     summaries.append(f"Failed to merge cells: {e}")
+
+            elif action == "set_alignment":
+                alignment = params.get("alignment", "center")
+                from docx.enum.table import WD_TABLE_ALIGNMENT
+                align_map = {
+                    "left": WD_TABLE_ALIGNMENT.LEFT,
+                    "center": WD_TABLE_ALIGNMENT.CENTER,
+                    "right": WD_TABLE_ALIGNMENT.RIGHT,
+                }
+                tbl.alignment = align_map.get(alignment, WD_TABLE_ALIGNMENT.CENTER)
+                summaries.append(f"Set alignment of table {t_idx} to {alignment}")
+
+            elif action == "set_width_pct":
+                width_pct = float(params.get("width_pct", 1.0))
+                try:
+                    section = doc.sections[0]
+                    usable_width = section.page_width - section.left_margin - section.right_margin
+                except Exception:
+                    usable_width = int(5940000) # Fallback to ~A4 EMU
+                    
+                target_width = int(usable_width * width_pct)
+                tbl.autofit = False
+                col_count = len(tbl.rows[0].cells) if len(tbl.rows) > 0 else 1
+                col_width = int(target_width / max(1, col_count))
+                
+                for row in tbl.rows:
+                    for cell in row.cells:
+                        cell.width = col_width
+                
+                summaries.append(f"Set width of table {t_idx} to {int(width_pct*100)}%")
 
             elif action == "set_cell_bg" or action == "alternate_rows" or action == "set_header_format":
                 # For simplicity, we implement some basic iteration
@@ -3537,6 +3866,16 @@ class DocumentProcessor:
                         },
                         "runs": runs,
                     }
+                    
+                    include_in_toc = (role == "heading")
+                    if include_in_toc and para._p.pPr is not None:
+                        from docx.oxml.ns import qn as _qn
+                        outlineLvl = para._p.pPr.find(_qn('w:outlineLvl'))
+                        if outlineLvl is not None and outlineLvl.get(_qn('w:val')) == '9':
+                            include_in_toc = False
+                    if include_in_toc or role == "heading":
+                        node["include_in_toc"] = include_in_toc
+                    
                     if heading_level is not None:
                         node["heading_level"] = heading_level
 

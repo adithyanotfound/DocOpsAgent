@@ -11,9 +11,9 @@ import {
   X,
 } from "lucide-react";
 import { FormEvent, useEffect, useRef, useState } from "react";
-import { rollback, sendChat } from "../api";
+import { rollback, startChat, pollRun } from "../api";
 import { useAppStore } from "../store";
-import type { AgentContent, SocketEvent, Workspace } from "../types";
+import type { AgentContent, Workspace } from "../types";
 
 type Props = {
   workspace: Workspace;
@@ -32,8 +32,7 @@ export function ChatPanel({ workspace }: Props) {
     liveThoughts,
     liveVersionTile,
     startAgentRun,
-    pushThought,
-    setLiveVersionTile,
+    applyPollEvents,
     endAgentRun,
   } = useAppStore();
 
@@ -43,38 +42,18 @@ export function ChatPanel({ workspace }: Props) {
   const [imagePreview, setImagePreview] = useState<string | null>(null);
   const bottomRef = useRef<HTMLDivElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  
+  // Keep track of active poll interval to clear on unmount
+  const pollIntervalRef = useRef<number | null>(null);
 
-  // ---- WebSocket ------------------------------------------------------
+  // Clear polling on unmount
   useEffect(() => {
-    const protocol = window.location.protocol === "https:" ? "wss" : "ws";
-    const socket = new WebSocket(
-      `${protocol}://${window.location.host}/api/workspaces/${workspace.id}/ws`
-    );
-
-    socket.onmessage = async (msg) => {
-      const event = JSON.parse(msg.data) as SocketEvent;
-
-      if (event.type === "thought") {
-        pushThought(event.content);
-      }
-
-      if (event.type === "version_created") {
-        setLiveVersionTile({
-          version_number: event.version_number,
-          pdf_url: event.pdf_url,
-          document_url: event.document_url,
-        });
-      }
-
-      if (event.type === "completed" || event.type === "error") {
-        await queryClient.refetchQueries({ queryKey: ["workspace", workspace.id] });
-        await queryClient.refetchQueries({ queryKey: ["workspaces"] });
-        endAgentRun();
+    return () => {
+      if (pollIntervalRef.current) {
+        clearInterval(pollIntervalRef.current);
       }
     };
-
-    return () => socket.close();
-  }, [workspace.id, pushThought, setLiveVersionTile, endAgentRun, queryClient]);
+  }, []);
 
   // ---- Auto-scroll ---------------------------------------------------
   useEffect(() => {
@@ -102,16 +81,49 @@ export function ChatPanel({ workspace }: Props) {
     setImagePreview(null);
   }
 
-  // ---- Chat mutation -------------------------------------------------
+  // ---- Chat mutation & Polling ---------------------------------------
   const chatMutation = useMutation({
     mutationFn: ({ content, image }: { content: string; image?: File }) =>
-      sendChat(workspace.id, content, image),
-    onMutate: ({ content }) => startAgentRun(content),
-    onSuccess: async () => {
-      await queryClient.refetchQueries({ queryKey: ["workspace", workspace.id] });
-      await queryClient.refetchQueries({ queryKey: ["workspaces"] });
+      startChat(workspace.id, content, image),
+    onMutate: ({ content }) => {
+      startAgentRun(content);
     },
-    onSettled: () => {
+    onSuccess: (data) => {
+      const runId = data.run_id;
+      
+      // Start polling
+      if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
+      
+      pollIntervalRef.current = window.setInterval(async () => {
+        try {
+          const pollRes = await pollRun(runId);
+          
+          if (pollRes.events) {
+            applyPollEvents(pollRes.events);
+          }
+          
+          if (pollRes.status === "completed" || pollRes.status === "error") {
+            if (pollIntervalRef.current) {
+              clearInterval(pollIntervalRef.current);
+              pollIntervalRef.current = null;
+            }
+            
+            if (pollRes.status === "completed" && pollRes.workspace) {
+              // Directly apply the serialized workspace to the cache
+              queryClient.setQueryData(["workspace", workspace.id], pollRes.workspace);
+              queryClient.invalidateQueries({ queryKey: ["workspaces"] });
+            }
+            
+            endAgentRun();
+          }
+        } catch (err) {
+          console.error("Polling error:", err);
+          // Keep trying, transient network errors shouldn't break the UI
+        }
+      }, 1500); // Short-poll every 1.5s
+    },
+    onError: () => {
+      // If the POST /chat itself fails
       endAgentRun();
     },
   });

@@ -146,8 +146,9 @@ _AI_DESIGN_PATTERNS = [
     r"\bimprove\s+(the\s+)?(design|layout|visual|look|appearance)\b",
     r"\bbetter\s+(design|layout|look)\b",
     r"\bvisual\s+(hierarchy|consistency|polish)\b",
-    r"\bnormalize\s+(fonts?|spacing|formatting)\b",
-    r"\bmake\s+(fonts?|spacing|formatting)\s+consistent\b",
+    r"\bnormalize\s+(fonts?|spacing|formatting|headings?)\b",
+    r"\bmake\s+(fonts?|spacing|formatting|headings?)\s+consistent\b",
+    r"\bconsistent\s+(headings?|fonts?|formatting|spacing)\b",
     r"\bbalance\s+whitespace\b",
     r"\bauto\s*(fix|clean|layout)\b",
     r"\bremove\s+overlap(s|ping)?\b",
@@ -176,9 +177,22 @@ _CHART_PATTERNS = [
 
 _LAYOUT_PATTERNS = [
     r"\bmove\s+(the\s+)?(section|block|paragraph|heading)\b",
+    r"\bmove\s+.{0,60}\b(before|after|above|below)\b",
     r"\binsert\s+(a\s+)?page\s*break\b",
     r"\b(page\s*break|section\s*break)\b",
-    r"\breorder\s+(the\s+)?(sections|paragraphs)\b",
+    r"\breorder\s+(the\s+)?(sections|paragraphs|document)\b",
+    r"\breorganize\b",
+    r"\brearrange\b",
+    r"\b(put|place|move)\s+.{0,60}\b(before|after|above|below)\b",
+    # Generative content patterns
+    r"\binsert\s+(a\s+)?(new\s+)?(section|chapter|heading)\b",
+    r"\badd\s+(a\s+)?(new\s+)?(section|chapter|heading)\b",
+    r"\btable\s+of\s+contents?\b",
+    r"\btoC\b",
+    r"\bduplicate\s+(the\s+)?(section|block|paragraph|heading)\b",
+    r"\bremove\s+(the\s+)?(section|block|paragraph|heading|chapter)\b",
+    r"\bdelete\s+(the\s+)?(section|block|paragraph|heading|chapter)\b",
+    r"\badd\s+.{0,40}\bsection\b",
 ]
 
 _LIST_PATTERNS = [
@@ -242,33 +256,37 @@ class IntentClassifier:
             "CRITICAL RULES (must follow exactly):\n"
             "1. If the request involves ANY of: colors, bold, italic, underline, font size, "
             "font family, alignment, spacing, background color, text color, highlighting — "
-            "set mode='operations' and op_category='text_format'. "
+            "set mode='operations' and include 'text_format' in op_categories. "
             "These CANNOT be done in edit mode.\n"
             "2. If the request involves creating/inserting/deleting tables, rows, columns — "
-            "mode='operations', op_category='table_op'.\n"
+            "mode='operations', include 'table_op' in op_categories.\n"
             "3. If the request involves inserting/removing/resizing images or logos — "
-            "mode='operations', op_category='image_op'.\n"
+            "mode='operations', include 'image_op' in op_categories.\n"
             "4. If the request involves backgrounds, themes, color palettes — "
-            "mode='operations', op_category='theme_op'.\n"
+            "mode='operations', include 'theme_op' in op_categories.\n"
             "5. If the request involves adding/deleting/duplicating slides — "
-            "mode='operations', op_category='slide_op'.\n"
-            "6. If the request involves charts — mode='operations', op_category='chart_op'.\n"
-            "7. If the request involves structural layout changes (moving sections, page breaks) — "
-            "mode='operations', op_category='layout_op'.\n"
+            "mode='operations', include 'slide_op' in op_categories.\n"
+            "6. If the request involves charts — mode='operations', include 'chart_op' in op_categories.\n"
+            "7. If the request involves structural layout changes (moving sections, page breaks, reorganizing) — "
+            "mode='operations', include 'layout_op' in op_categories.\n"
             "8. If the request involves lists (converting formats, adding items, sorting) — "
-            "mode='operations', op_category='list_op'.\n"
-            "9. If the request involves document-wide find and replace (replace all occurrences of X with Y) — "
-            "mode='operations', op_category='find_replace'.\n"
+            "mode='operations', include 'list_op' in op_categories.\n"
+            "9. If the request involves document-wide find and replace — "
+            "mode='operations', include 'find_replace' in op_categories.\n"
             "10. If the request involves 'make professional', 'improve design', 'normalize fonts', "
-            "'generate speaker notes' — mode='operations', op_category='ai_design_op'.\n"
+            "'make consistent', 'make headings consistent', 'generate speaker notes' — mode='operations', include 'ai_design_op' in op_categories.\n"
             "11. If generating/creating a full new presentation or populating a deck — mode='generate'.\n"
             "12. Only use mode='edit' for pure TEXT CONTENT rewrites (rewriting sentences/paragraphs, "
             "adding/removing text content) with NO formatting changes.\n\n"
+            "COMPOUND PROMPTS: If the user asks for multiple distinct actions (e.g. 'reorganize + convert list + "
+            "make headings consistent'), you MUST list ALL matching categories in op_categories. "
+            "op_category should be the PRIMARY category. op_categories should list EVERY category needed.\n\n"
             "Return JSON with:\n"
             "  - mode (str): 'generate' | 'operations' | 'edit'\n"
-            "  - op_category (str): when mode='operations', one of: "
+            "  - op_category (str): when mode='operations', the PRIMARY category from: "
             "'text_format'|'table_op'|'image_op'|'shape_op'|'theme_op'|'slide_op'|'chart_op'|'layout_op'|'list_op'|'find_replace'|'ai_design_op'. "
             "Empty string for other modes.\n"
+            "  - op_categories (list[str]): ALL categories needed for this request (may have multiple for compound prompts).\n"
             "  - topic (str): if mode='generate', the subject. Otherwise ''.\n"
             "  - slide_count (int|null): number of slides requested. null if not specified.\n"
             "  - delete_slides (list[int]): 1-based slide numbers to delete. [] if none.\n"
@@ -308,9 +326,20 @@ class IntentClassifier:
         if mode not in ("edit", "generate", "operations"):
             mode = "edit"
 
+        op_category = str(data.get("op_category", ""))
+        raw_cats = data.get("op_categories", [])
+        op_categories = [
+            str(c) for c in raw_cats
+            if isinstance(c, str) and c
+        ] if isinstance(raw_cats, list) else []
+        # Ensure primary category is always in the list
+        if op_category and op_category not in op_categories:
+            op_categories.insert(0, op_category)
+
         return {
             "mode": mode,
-            "op_category": str(data.get("op_category", "")),
+            "op_category": op_category,
+            "op_categories": op_categories,
             "topic": str(data.get("topic", "")),
             "slide_count": data.get("slide_count") if isinstance(data.get("slide_count"), int) else None,
             "delete_slides": [s for s in data.get("delete_slides", []) if isinstance(s, int)],
@@ -332,33 +361,28 @@ class IntentClassifier:
         # Check for generation patterns first
         is_generate = any(re.search(p, lowered) for p in _GENERATE_PATTERNS)
 
-        # Check for operations-mode patterns
-        op_category = ""
+        # Detect ALL matching operation categories for compound prompts
+        op_categories: list[str] = []
         if not is_generate:
-            if _matches(_FORMAT_PATTERNS, request):
-                op_category = "text_format"
-            elif _matches(_TABLE_PATTERNS, request):
-                op_category = "table_op"
-            elif _matches(_IMAGE_PATTERNS, request):
-                op_category = "image_op"
-            elif _matches(_SHAPE_PATTERNS, request):
-                op_category = "shape_op"
-            elif _matches(_THEME_PATTERNS, request):
-                op_category = "theme_op"
-            elif _matches(_SLIDE_OP_PATTERNS, request):
-                op_category = "slide_op"
-            elif _matches(_CHART_PATTERNS, request):
-                op_category = "chart_op"
-            elif _matches(_LAYOUT_PATTERNS, request):
-                op_category = "layout_op"
-            elif _matches(_LIST_PATTERNS, request):
-                op_category = "list_op"
-            elif _matches(_FIND_REPLACE_PATTERNS, request):
-                op_category = "find_replace"
-            elif _matches(_AI_DESIGN_PATTERNS, request):
-                op_category = "ai_design_op"
+            _CAT_CHECKS = [
+                ("text_format",  _FORMAT_PATTERNS),
+                ("table_op",     _TABLE_PATTERNS),
+                ("image_op",     _IMAGE_PATTERNS),
+                ("shape_op",     _SHAPE_PATTERNS),
+                ("theme_op",     _THEME_PATTERNS),
+                ("slide_op",     _SLIDE_OP_PATTERNS),
+                ("chart_op",     _CHART_PATTERNS),
+                ("layout_op",    _LAYOUT_PATTERNS),
+                ("list_op",      _LIST_PATTERNS),
+                ("find_replace", _FIND_REPLACE_PATTERNS),
+                ("ai_design_op", _AI_DESIGN_PATTERNS),
+            ]
+            for cat, patterns in _CAT_CHECKS:
+                if _matches(patterns, request):
+                    op_categories.append(cat)
 
-        is_operations = bool(op_category) and not is_generate
+        op_category = op_categories[0] if op_categories else ""
+        is_operations = bool(op_categories) and not is_generate
         mode = "generate" if is_generate else ("operations" if is_operations else "edit")
 
         # Extract topic (rough heuristic)
@@ -393,6 +417,7 @@ class IntentClassifier:
         return {
             "mode": mode,
             "op_category": op_category,
+            "op_categories": op_categories if not is_generate else [],
             "topic": topic if is_generate else "",
             "slide_count": slide_count,
             "delete_slides": delete_slides,

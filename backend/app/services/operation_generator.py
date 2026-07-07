@@ -45,22 +45,27 @@ Available operation types and their parameter schemas:
                 match_text (exact substring to apply formatting to inside the target paragraph),
                 match_role (e.g. "heading", "body", "bullet_point" - ONLY used when target_id is "all"),
                 alignment ("left"|"center"|"right"|"justify"),
+                space_before_pt (float), space_after_pt (float),
                 line_spacing (multiplier), char_spacing (pt),
-                superscript, subscript, shadow, page_break_before (boolean — DOCX only, makes the paragraph start on a new page)}
+                superscript, subscript, shadow, page_break_before (boolean — DOCX only, makes the paragraph start on a new page),
+                include_in_toc (boolean — DOCX only, sets whether a heading appears in the Table of Contents)
+                IMPORTANT: alignment, line_spacing, space_before_pt, space_after_pt, page_break_before, and include_in_toc are PARAGRAPH-LEVEL properties. They CANNOT be used with match_text. If you need to right-align a specific line inside a multi-line paragraph (like a Date), you must use text_edit to replace the paragraph text, adding tabs (\t) before the date to push it to the right.}
 
 3. table_op — Table CRUD
    target_id: string (ID of the table from the DOM, "all" for all tables, or null to create new)
    parameters: {
      action: "create"|"delete"|"add_row"|"remove_row"|"add_col"|"remove_col"
              |"merge_cells"|"set_cell_bg"|"set_borders"|"alternate_rows"
-             |"populate"|"set_header_format"|"sort_data"|"set_cell_alignment"|"apply_theme",
+             |"populate"|"set_header_format"|"sort_data"|"set_cell_alignment"|"apply_theme"
+             |"set_alignment"|"set_width_pct",
      rows, cols, header_row, alternate_row_colors [hex1, hex2], theme_color_hex,
      data [[row1col1, ...], ...] (For add_col/add_row with a title, provide it in data, e.g. ["Q3"]), 
      row_index, col_index (Must provide these for populate to target the correct row/col, e.g., last column),
      merge_from [row,col], merge_to [row,col],
      cell_bg_hex, border_color_hex, border_width_pt,
      position {left_pct, top_pct, width_pct, height_pct},
-     cell_padding_pt, cell_alignment
+     cell_padding_pt, cell_alignment, alignment ("left"|"center"|"right" - for set_alignment),
+     width_pct (float, e.g. 1.0 for 100% width - for set_width_pct)
    }
 
 4. image_op — Image operations
@@ -179,15 +184,26 @@ Available operation types and their parameter schemas:
     parameters: {
       action: "move_block"        — Move a contiguous block of paragraphs/tables to a new position
               |"insert_page_break" — Insert a hard page break immediately before a target element
+              |"duplicate_block"  — Clone a section (from start_id to end_id) and insert it
+              |"remove_block"     — Delete an entire section (from start_id to end_id)
+              |"insert_block"     — Create a brand new section from scratch using a data array
+              |"insert_toc"       — Insert a native Word Table of Contents field
     }
 
-    For action="move_block":
-      start_id: string   — DOM id of the FIRST element in the block to move (e.g. "paragraph_5")
-      end_id: string     — DOM id of the LAST element in the block to move (e.g. "paragraph_9").  Include ALL paragraphs between the heading and the next heading/section.
-      before_id: string  — DOM id of the element to insert the moved block BEFORE
+    For action="move_block", "duplicate_block", "remove_block":
+      start_id: string   — DOM id of the FIRST element in the block to move/copy/delete (e.g. "paragraph_5")
+      end_id: string     — DOM id of the LAST element in the block. Include ALL paragraphs between the heading and the next heading/section.
+      before_id: string  — (move/copy only) DOM id of the element to insert the block BEFORE
+      after_id: string   — (move/copy only) OR use this to insert AFTER. To move a block to the VERY END of the document, set `after_id` to the ID of the last element in the document.
 
-    For action="insert_page_break":
-      before_id: string  — DOM id of the element before which the hard page break should be inserted
+    For action="insert_page_break", "insert_toc":
+      before_id: string  — DOM id of the element to insert BEFORE
+      after_id: string   — OR DOM id of the element to insert AFTER
+
+    For action="insert_block":
+      before_id: string  — DOM id of the element to insert BEFORE
+      after_id: string   — OR DOM id of the element to insert AFTER
+      data: array        — The paragraphs to insert. E.g. [{"role": "heading", "text": "New Title", "heading_level": 1}, {"role": "body", "text": "Some text"}]
 
     DOCX examples:
       Move "Action Items" section (paragraph_5 through paragraph_9) to appear before "Highlights" section (paragraph_2):
@@ -282,6 +298,7 @@ RULES:
 14. When the user asks to modify multiple rows or specific cells in a table, DO NOT use a single table_op with 'set_header_format' unless they only asked for headers. You MUST iterate and generate a 'text_edit' or 'text_format' operation for EACH cell/paragraph you wish to modify, targeting its specific DOM ID.
 15. If asked to apply a change globally, find all relevant IDs in the DOM and generate an operation for each, OR use target_id: "all" if the schema supports it.
 16. CRITICAL: For text formatting (text_format) across all headings, bodies, or the entire document, you MUST use `target_id: "all"` and `match_role`. DO NOT output a separate text_format operation for each paragraph! This will exceed output token limits.
+17. To remove a heading from the Table of Contents or prevent a new heading from appearing in it, you MUST use a `text_format` operation on the heading's target ID and set `include_in_toc: false`. Do NOT pass `include_in_toc` inside the data array of an `insert_block` operation, as it is invalid there.
 17. CRITICAL: DO NOT repeat the same operation multiple times. Once you have generated the operations for all steps in the user's prompt, YOU MUST close the JSON array `]` and STOP generating.
 
 DOCX-SPECIFIC RULES (apply when the document type is DOCX):
@@ -300,6 +317,13 @@ DOCX-SPECIFIC RULES (apply when the document type is DOCX):
 21. To INCREASE PAGE MARGINS in a DOCX: use `theme_op` with `action: "set_margins"` and `margin_inches` (e.g. 1.5 for 1.5-inch margins).
 22. To ADD PAGE NUMBERS to a DOCX footer: use `theme_op` with `action: "add_page_numbers"`.
 23. For multi-step DOCX structural requests (move + page break + margins + page numbers), produce ALL required operations in one JSON array.
+
+FINAL COMPLETENESS CHECK (MANDATORY — do this before closing the JSON array):
+Before you write the closing `]`, mentally review the user's original request and verify:
+  - Is EVERY distinct sub-task (reorganize, convert list, format headings, etc.) covered by at least one operation?
+  - If you find a sub-task with no operations, ADD the missing operations NOW before closing.
+  - Only close the array when every sub-task has been addressed.
+  - This check is CRITICAL for multi-step prompts.
 
 DOCX IMAGE RULES (apply when document type is DOCX and request involves images):
 24. In DOCX, images are identified by `image_N` DOM IDs in the structure (e.g. 'image_0', 'image_1'). Use these as `target_id` for image operations.
@@ -341,9 +365,40 @@ DOCX LIST RULES (apply when document type is DOCX and request involves lists):
     - IMPORTANT: All start_id/end_id values in sort_items MUST cover the full list including newly added items. Since add_items inserts AFTER end_id, and sort_items needs to cover all items, for sort_items use the same start_id as the first item and end_id as the original last item (the new items will be inserted after it and also be covered by the sort if they share the same parent region).
     - NOTE: After add_items, the new paragraphs do NOT have stable DOM IDs yet (they were inserted dynamically). Use the sort_items operation on the original range — the backend sorts all list paragraphs found between start_id and end_id including newly inserted ones.
 
-37. For "replace all occurrences" or "find and replace" tasks, use `find_replace` with `target_id: "all"`.
+DOCX GENERATIVE CONTENT RULES (apply when user asks to ADD new sections, duplicate, remove, or add Table of Contents):
+
+37. To ADD A NEW SECTION (e.g. "Add a Conclusion section", "Insert a Risks and Challenges section"):
+    - Use `layout_op` with `action: "insert_block"`.
+    - Set `after_id` to the DOM id of the LAST paragraph of the preceding section. If adding at the end, use the last paragraph in the document.
+    - Set `before_id` to the DOM id of the first paragraph of the FOLLOWING section, if inserting in the middle of the document.
+    - The `data` array MUST contain:
+      a. A heading item: {{"role": "heading", "text": "<Section Title>", "heading_level": 2}}
+      b. At least 2 body items with descriptive placeholder text starting with '[placeholder]': {{"role": "body", "text": "[placeholder] <a 1-2 sentence description of what this section should contain>"}}
+    - IMPORTANT: The ContentEnricher will replace the body text with rich, contextually appropriate content. Just make the heading correct and provide a meaningful 1-sentence description in each body item starting with '[placeholder]' so the enricher knows what to write.
+    - NEVER use `data: []` (empty array) — always include at least a heading item.
+
+38. To ADD A TABLE OF CONTENTS:
+    - Use `layout_op` with `action: "insert_toc"`.
+    - Set `before_id` to the DOM id of the FIRST content paragraph in the document (to insert the ToC at the very beginning).
+    - The system will automatically build a visible table from the document's actual headings. You do NOT need to provide data.
+
+39. To DUPLICATE A SECTION (e.g. "Duplicate the Key Metrics section"):
+    - Use `layout_op` with `action: "duplicate_block"`.
+    - `start_id` = DOM id of the section's heading paragraph.
+    - `end_id` = DOM id of the LAST paragraph/table belonging to that section (stop before the next heading).
+    - `after_id` = DOM id of the `end_id` element (to insert the copy immediately after the original).
+
+40. To REMOVE A SECTION (e.g. "Remove the Formatting Playground section"):
+    - Use `layout_op` with `action: "remove_block"`.
+    - `start_id` = DOM id of the section's heading paragraph.
+    - `end_id` = DOM id of the LAST paragraph/table belonging to that section (stop before the next heading).
+    - Use the `body_index` field in the structure to find the boundaries: the section ends just before the paragraph with the next lower or equal heading level.
+
+41. For "find and replace" or "replace all occurrences" tasks, use `find_replace` with `target_id: "all"`.
     - Set `is_regex: true` if you are using regex in `find_text` (e.g. replacing all dates, phone numbers).
     - If the user generically asks to replace a "placeholder" (e.g. "change the date placeholder"), you MUST look at the provided DOM to find the exact text of the placeholder (like "[DD Month YYYY]", "<Date>", etc.) and use that exact string (or a regex) in `find_text`.
+
+
 
 CURRENT DATE: {{CURRENT_DATE}}
 
@@ -486,6 +541,7 @@ class OperationGenerator:
         attached_image_path: str | None = None,
         previous_ops: list[dict] | None = None,
         reviewer_feedback: str | None = None,
+        missed_tasks: list[str] | None = None,
     ) -> list[dict]:
         """Generate operations for the given request.
         
@@ -497,6 +553,7 @@ class OperationGenerator:
                 return self._generate_with_llm(
                     request, structure, document_type, chat_history,
                     intent, attached_image_path, previous_ops, reviewer_feedback,
+                    missed_tasks,
                 )
             except Exception as exc:
                 log.exception("LLM operation generation failed: %s", exc)
@@ -517,6 +574,7 @@ class OperationGenerator:
         attached_image_path: str | None,
         previous_ops: list[dict] | None,
         reviewer_feedback: str | None,
+        missed_tasks: list[str] | None = None,
     ) -> list[dict]:
         from openai import OpenAI
         from datetime import datetime
@@ -551,21 +609,70 @@ class OperationGenerator:
         # Previous ops + feedback (for refinement rounds)
         refinement_str = ""
         if reviewer_feedback and previous_ops:
+            missed_str = ""
+            if missed_tasks:
+                missed_str = (
+                    f"\nSub-tasks still MISSING (must be included in your new list):\n"
+                    + "\n".join(f"  - {t}" for t in missed_tasks)
+                    + "\n"
+                )
             refinement_str = (
-                f"\nPrevious operations attempted:\n{json.dumps(previous_ops, indent=2)}\n"
+                f"\nPrevious attempt (context only — do NOT copy these verbatim):\n{json.dumps(previous_ops, indent=2)}\n"
                 f"Reviewer feedback: {reviewer_feedback}\n"
-                "Please improve the operations based on this feedback.\n"
+                f"{missed_str}"
+                "IMPORTANT: Regenerate the COMPLETE operation list from scratch, fixing the issues above.\n"
+                "Your new list replaces the previous one entirely — include ALL operations needed,\n"
+                "both the ones that were correct AND the fixed/new ones for the missing sub-tasks.\n"
+                "Do NOT emit a partial list.\n"
             )
 
-        intent_str = f"Detected intent category: {intent.get('op_category', 'unknown')}\n"
+        # Build op_categories hint
+        op_categories = intent.get("op_categories", [])
+        if not op_categories:
+            primary = intent.get("op_category", "")
+            op_categories = [primary] if primary else []
+        categories_str = ""
+        if op_categories:
+            categories_str = (
+                f"Operation categories needed for this request: {', '.join(op_categories)}\n"
+                "You MUST produce operations covering ALL of the above categories.\n"
+            )
+
+        # Build a brief document summary for generative requests
+        # (helps the LLM correctly place new sections and write descriptive placeholder text)
+        doc_summary_str = ""
+        if document_type == "docx":
+            dom_children = structure.get("dom", {}).get("children", [])
+            heading_titles = [
+                el.get("text", "").strip()
+                for el in dom_children
+                if el.get("type") == "paragraph" and el.get("role") == "heading"
+                and el.get("text", "").strip()
+            ]
+            body_excerpts = [
+                el.get("text", "").strip()[:200]
+                for el in dom_children
+                if el.get("type") == "paragraph" and el.get("role") == "body"
+                and el.get("text", "").strip()
+            ][:3]
+            if heading_titles or body_excerpts:
+                doc_summary_str = "Document summary for context:\n"
+                if heading_titles:
+                    doc_summary_str += f"  Sections: {', '.join(heading_titles[:12])}\n"
+                if body_excerpts:
+                    doc_summary_str += f"  Content excerpt: {' '.join(body_excerpts)[:400]}\n"
+                doc_summary_str += "\n"
 
         user_prompt = (
             f"{history_str}"
             f"{image_str}"
-            f"{intent_str}"
+            f"{categories_str}"
+            f"{doc_summary_str}"
             f"Document structure:\n{structure_summary}\n\n"
             f"{refinement_str}"
             f"User instruction: {request}\n\n"
+            "IMPORTANT: Before closing the JSON array, verify that every sub-task in the user "
+            "instruction has at least one operation covering it. Add any missing operations now.\n"
             "Return a JSON array of operation objects."
         )
 
@@ -575,8 +682,8 @@ class OperationGenerator:
                 {"role": "system", "content": sys_prompt},
                 {"role": "user", "content": user_prompt},
             ],
-            temperature=0.5,
-            max_tokens=4096,
+            temperature=0.3,
+            max_tokens=8192,
             response_format={"type": "json_object"},
         )
 

@@ -37,19 +37,35 @@ export async function deleteWorkspace(id: string): Promise<void> {
   }
 }
 
-export async function sendChat(workspaceId: string, content: string, image?: File): Promise<void> {
+export async function startChat(workspaceId: string, content: string, image?: File): Promise<{ run_id: string }> {
   const form = new FormData();
+  form.append("workspace_id", workspaceId);
   form.append("content", content);
   if (image) {
     form.append("image", image);
   }
-  await parse(
-    await fetch(`${API_BASE}/api/workspaces/${workspaceId}/chat`, {
+  return parse<{ run_id: string }>(
+    await fetch(`${API_BASE}/api/chat`, {
       method: "POST",
       body: form,
       // Do NOT set Content-Type; browser will set multipart boundary automatically
     })
   );
+}
+
+export type PollEvent = 
+  | { type: "thought"; content: string; iteration: number }
+  | { type: "version_created"; version_number: number; pdf_url: string; document_url: string };
+
+export type PollResponse = {
+  status: "running" | "completed" | "error" | "not_found";
+  events: PollEvent[];
+  workspace: Workspace | null;
+  error: string | null;
+};
+
+export async function pollRun(runId: string): Promise<PollResponse> {
+  return parse<PollResponse>(await fetch(`${API_BASE}/api/polling/${runId}`));
 }
 
 export async function rollback(workspaceId: string, version: number): Promise<Workspace> {
