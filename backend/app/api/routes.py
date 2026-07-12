@@ -127,10 +127,12 @@ async def _run_agent_background(
     run_id: str,
     attached_image_path: str | None,
     db: Session,
+    provider: str | None = None,
+    model: str | None = None,
 ) -> None:
     """Background coroutine: runs the full pipeline and writes results to run_store."""
     try:
-        await DocumentAgent(db).run(
+        await DocumentAgent(db, provider=provider, model=model).run(
             workspace_id,
             request,
             run_id=run_id,
@@ -148,6 +150,8 @@ async def chat(
     workspace_id: str = Form(...),
     content: str = Form(...),
     image: UploadFile | None = File(None),
+    provider: str | None = Form(None),
+    model: str | None = Form(None),
     db: Session = Depends(get_db),
 ) -> dict:
     from app.core.config import settings
@@ -186,6 +190,8 @@ async def chat(
         run_id,
         attached_image_path,
         db,
+        provider,
+        model,
     )
 
     return {"run_id": run_id}

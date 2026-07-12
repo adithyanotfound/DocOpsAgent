@@ -40,6 +40,7 @@ export function ChatPanel({ workspace }: Props) {
   const [draft, setDraft] = useState("");
   const [attachedImage, setAttachedImage] = useState<File | null>(null);
   const [imagePreview, setImagePreview] = useState<string | null>(null);
+  const [selectedModel, setSelectedModel] = useState<string>("gpt-4o-mini");
   const bottomRef = useRef<HTMLDivElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   
@@ -83,8 +84,8 @@ export function ChatPanel({ workspace }: Props) {
 
   // ---- Chat mutation & Polling ---------------------------------------
   const chatMutation = useMutation({
-    mutationFn: ({ content, image }: { content: string; image?: File }) =>
-      startChat(workspace.id, content, image),
+    mutationFn: ({ content, image, provider, model }: { content: string; image?: File; provider: string; model: string }) =>
+      startChat(workspace.id, content, image, provider, model),
     onMutate: ({ content }) => {
       startAgentRun(content);
     },
@@ -144,7 +145,9 @@ export function ChatPanel({ workspace }: Props) {
     setDraft("");
     setAttachedImage(null);
     setImagePreview(null);
-    chatMutation.mutate({ content, image: img });
+    
+    const provider = selectedModel.startsWith("gemini") ? "gemini" : "openai";
+    chatMutation.mutate({ content, image: img, provider, model: selectedModel });
   }
 
   // ---- Render --------------------------------------------------------
@@ -266,7 +269,18 @@ export function ChatPanel({ workspace }: Props) {
 
       {/* Input area */}
       <form onSubmit={onSubmit} className="flex flex-col gap-0 border-t-2 border-ink">
-        <div className="flex gap-2 p-4">
+        <div className="flex px-4 pt-3 gap-2">
+          <select 
+            value={selectedModel}
+            onChange={(e) => setSelectedModel(e.target.value)}
+            className="text-xs border-2 border-ink bg-paper px-2 py-1 outline-none focus:bg-accent/30 font-medium cursor-pointer"
+            disabled={isAgentRunning}
+          >
+            <option value="gemini-2.5-flash">Gemini 2.5 Flash</option>
+            <option value="gpt-4o-mini">GPT-4o Mini</option>
+          </select>
+        </div>
+        <div className="flex gap-2 p-4 pt-2">
           <textarea
             className="min-h-20 flex-1 resize-none border-2 border-ink bg-paper p-3 text-sm font-medium outline-none focus:bg-accent/30 transition-colors"
             value={draft}

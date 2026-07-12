@@ -1,16 +1,16 @@
 """Slide Planner — generates a structured multi-slide content plan via LLM.
 
 Given a template's rich structure and a user request, the planner produces
-a complete slide plan in a single LLM call.  The plan specifies:
+a complete slide plan in a single LLM call. The plan specifies:
 - Which template slides to use as layout sources.
 - Whether to populate, keep, or delete each slide.
 - Text content for every text frame, with optional formatting overrides.
 
-This approach ensures cross-slide coherence (e.g. executive summary →
-detailed analysis → conclusion) because the LLM sees the full deck at once.
+Uses LLMClient for provider-agnostic LLM calls (Gemini by default).
 """
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import logging
 
@@ -24,6 +24,9 @@ MAX_SLIDES = 20  # Hard cap on generated slides
 class SlidePlanner:
     """Generates a structured slide plan from a template + user request."""
 
+    def __init__(self, llm=None) -> None:
+        self._llm = llm
+
     def plan(
         self,
         request: str,
@@ -31,72 +34,39 @@ class SlidePlanner:
         intent: dict,
         chat_history: list[dict] | None = None,
     ) -> dict:
-        """Produce a slide plan dict.
+        """Produce a slide plan dict."""
+        if not (settings.gemini_api_key or settings.openai_api_key):
+            return self._plan_local(request, template_structure, intent)
 
-        Returns::
+        # Generate outline
+        outline = self._generate_outline(
+            request=request,
+            template_structure=template_structure,
+            intent=intent,
+            chat_history=chat_history or [],
+        )
 
-            {
-                "slides": [
-                    {
-                        "source_slide_index": 1,
-                        "action": "populate",
-                        "shapes": [
-                            {
-                                "shape_index": 0,
-                                "paragraphs": [
-                                    {
-                                        "para_index": 0,
-                                        "text": "...",
-                                        "formatting": {
-                                            "font_size_pt": null,
-                                            "bold": null,
-                                            "color_hex": null,
-                                            "alignment": null
-                                        }
-                                    }
-                                ]
-                            }
-                        ]
-                    }
-                ]
-            }
-        """
-        if settings.openai_api_key:
-            try:
-                return self._plan_with_llm(request, template_structure, intent, chat_history or [])
-            except Exception as exc:
-                log.exception("LLM slide planning failed: %s", exc)
-        return self._plan_local(request, template_structure, intent)
+        if not outline:
+            return self._plan_local(request, template_structure, intent)
 
-    # ------------------------------------------------------------------
-    # LLM path
-    # ------------------------------------------------------------------
+        # Process each slide's content (populate, delete, keep)
+        def process_slide(slide_outline: dict) -> dict:
+            action = slide_outline.get("action", "populate")
+            src_idx = slide_outline.get("source_slide_index", 1)
 
-    def _plan_with_llm(
-        self,
-        request: str,
-        template_structure: dict,
-        intent: dict,
-        chat_history: list[dict],
-    ) -> dict:
-        import concurrent.futures
-
-        # Phase 1: Generate Outline
-        outline = self._generate_outline(request, template_structure, intent, chat_history)
-
-        # Phase 2: Generate Slide Content Concurrently
-        slides = []
-        # Sort slides by their original index to preserve order later
-        # outline has [{"source_slide_index": X, "action": "...", "outline": "..."}, ...]
-        
-        def process_slide(slide_outline):
-            if slide_outline.get("action") == "delete" or not slide_outline.get("outline"):
+            if action == "delete":
                 return {
-                    "source_slide_index": slide_outline.get("source_slide_index", 1),
-                    "action": slide_outline.get("action", "populate"),
-                    "shapes": []
+                    "source_slide_index": src_idx,
+                    "action": "delete",
+                    "shapes": [],
                 }
-            
+            if action == "keep":
+                return {
+                    "source_slide_index": src_idx,
+                    "action": "keep",
+                    "shapes": [],
+                }
+
             return self._generate_slide_content(
                 request=request,
                 template_structure=template_structure,
@@ -106,7 +76,6 @@ class SlidePlanner:
 
         # Run concurrent generation (max 10 workers for speed)
         with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-            # We map to preserve the exact order of the outline
             results = list(executor.map(process_slide, outline))
 
         # Build final plan
@@ -118,11 +87,9 @@ class SlidePlanner:
     def _generate_outline(
         self, request: str, template_structure: dict, intent: dict, chat_history: list[dict]
     ) -> list[dict]:
-        from openai import OpenAI
-        client = OpenAI(
-            api_key=settings.openai_api_key,
-            base_url=settings.openai_base_url or None,
-        )
+        from app.services.llm_client import LLMClient, LLMRequest
+
+        llm = self._llm or LLMClient()
 
         template_desc = self._describe_template(template_structure)
         topic = intent.get("topic", "")
@@ -167,47 +134,29 @@ class SlidePlanner:
             f"Available Layouts:\n{template_desc}"
         )
 
-        response = client.chat.completions.create(
-            model=settings.llm_model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
+        response = llm.complete(LLMRequest(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
             temperature=0.4,
             max_tokens=4096,
-            response_format={"type": "json_object"},
-        )
-        raw = (response.choices[0].message.content or "{}").strip()
-        import json
-        outline = []
-        try:
-            if raw.startswith("```json"):
-                raw = raw[7:]
-            if raw.endswith("```"):
-                raw = raw[:-3]
-            raw = raw.strip()
-            outline = json.loads(raw).get("outline", [])
-        except Exception as e:
-            print(f"Failed to parse JSON for outline: {e}")
-            print(f"Raw output: {raw[:200]}...")
-            
-        return outline
+            json_mode=True,
+        ))
+        
+        parsed = response.json or {}
+        return parsed.get("outline", [])
 
     def _generate_slide_content(
         self, request: str, template_structure: dict, slide_outline: dict, intent: dict
     ) -> dict:
-        from openai import OpenAI
-        client = OpenAI(
-            api_key=settings.openai_api_key,
-            base_url=settings.openai_base_url or None,
-        )
+        from app.services.llm_client import LLMClient, LLMRequest
+
+        llm = self._llm or LLMClient()
 
         src_idx = slide_outline.get("source_slide_index", 1)
         action = slide_outline.get("action", "populate")
         outline_text = slide_outline.get("outline", "")
         topic = intent.get("topic", "")
 
-        # Extract only the specific layout info for this slide
         slides = template_structure.get("slides", [])
         slide_info = next((s for s in slides if s["slide_index"] == src_idx), slides[0] if slides else {})
         layout_desc = self._describe_template({"slides": [slide_info]})
@@ -239,30 +188,16 @@ class SlidePlanner:
             f"Template Layout Shapes for this slide:\n{layout_desc}"
         )
 
-        response = client.chat.completions.create(
-            model=settings.llm_model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
+        response = llm.complete(LLMRequest(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
             temperature=0.5,
             max_tokens=4096,
-            response_format={"type": "json_object"},
-        )
-        raw = (response.choices[0].message.content or "{}").strip()
+            json_mode=True,
+        ))
         
-        import json
-        shapes = []
-        try:
-            if raw.startswith("```json"):
-                raw = raw[7:]
-            if raw.endswith("```"):
-                raw = raw[:-3]
-            raw = raw.strip()
-            shapes = json.loads(raw).get("shapes", [])
-        except Exception as e:
-            print(f"Failed to parse JSON for slide {src_idx}: {e}")
-            print(f"Raw output: {raw[:200]}...")
+        parsed = response.json or {}
+        shapes = parsed.get("shapes", [])
         
         return {
             "source_slide_index": src_idx,
@@ -300,12 +235,11 @@ class SlidePlanner:
                 for para in shape.get("paragraphs", []):
                     text = para.get("text", "")
                     if not text:
-                        # Fill empty frames with topic-based text
                         text = topic[:80]
                     paras.append({
                         "para_index": para["para_index"],
                         "text": text,
-                        "formatting": {},  # keep all existing formatting
+                        "formatting": {},
                     })
                 if paras:
                     shapes.append({
@@ -375,7 +309,7 @@ class SlidePlanner:
                         for cell in row:
                             cell_text = " ".join(p.get("text", "") for p in cell.get("paragraphs", []))
                             if len(cell_text) > 20:
-                                cell_text = cell_text[:17] + "..."
+                                  cell_text = cell_text[:17] + "..."
                             row_texts.append(cell_text if cell_text else "(empty)")
                         lines.append(f"      Row {r_idx}: {row_texts}")
 
@@ -390,7 +324,7 @@ class SlidePlanner:
         for slide in slides[:MAX_SLIDES]:
             src = slide.get("source_slide_index", 1)
             if not isinstance(src, int) or src < 1 or src > template_slide_count:
-                src = 1  # fallback
+                src = 1
 
             action = slide.get("action", "populate")
             if action not in ("populate", "keep", "delete"):

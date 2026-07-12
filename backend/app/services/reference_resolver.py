@@ -1,159 +1,192 @@
-import json
-import logging
-import difflib
+"""Reference Resolver — resolves target hints to stable DOM element IDs.
 
-from app.core.config import settings
+Two-pass resolution Strategy:
+1. Deterministic Structural Matching (No LLM): Handles ordinal lookups
+   ("table 2", "third paragraph"), exact named sections ("Conclusion"),
+   and structural roles ("all headings", "bulleted lists").
+2. LLM-assisted Semantic Matching: Falls back to Gemini to resolve
+   ambiguous descriptions ("the section discussing growth metrics").
+"""
+from __future__ import annotations
+
+import logging
+import re
+from typing import Any
+
+from app.services.llm_client import LLMClient, LLMRequest
 
 log = logging.getLogger(__name__)
 
 
 class ReferenceResolver:
-    """
-    Stage 2 of the pipeline.
-    Extracts text references and their intended structural outcome from the user request,
-    then deterministically matches the text against the document structure to find object IDs.
-    """
+    """Resolves target_hint to concrete DOM element IDs from the outline."""
 
-    def __init__(self):
-        from openai import OpenAI
-        self.client = OpenAI(
-            api_key=settings.openai_api_key,
-            base_url=settings.openai_base_url or None,
-        )
+    def __init__(self, llm: LLMClient | None = None) -> None:
+        self._llm = llm
 
-    def resolve(self, request: str, structure: dict) -> list[dict]:
-        """
-        Returns a list of resolved references.
-        Example:
-        [
-            {
-                "text": "Conclusion",
-                "object_id": "paragraph_17",
-                "confidence": 0.98,
-                "expected_state": [
-                    { "type": "position", "expected": "last" },
-                    { "type": "property", "property": "include_in_toc", "value": False }
-                ]
-            }
-        ]
-        """
-        # Step 1: Extract mentions and expected state via LLM
-        extracted = self._extract_mentions_llm(request)
-
-        # Step 2: Flatten document tree for searching
-        flat_nodes = self._flatten_dom(structure.get("dom", {}))
-
-        resolved_refs = []
-        for ref in extracted:
-            text = ref.get("text", "")
-            expected = ref.get("expected_state", [])
-            
-            if not text:
-                continue
-
-            # Step 3: Deterministic fuzzy match
-            best_id, best_conf = self._fuzzy_match(text, flat_nodes)
-
-            # If confidence is below threshold, flag as unresolved
-            if best_conf < 80:
-                log.warning(f"Low confidence ({best_conf}) for reference '{text}', flagging as unresolved.")
-                best_id = None
-            
-            resolved_refs.append({
-                "text": text,
-                "object_id": best_id,
-                "confidence": round(best_conf / 100.0, 2) if best_id else 0.0,
-                "expected_state": expected
-            })
-
-        return resolved_refs
-
-    def _extract_mentions_llm(self, request: str) -> list[dict]:
-        system_prompt = (
-            "You are a structural reference extractor for a document editing assistant.\n"
-            "Given a user request to modify a document, extract all entities or sections the user refers to "
-            "(e.g., 'Conclusion', 'the first table', 'the bulleted list').\n"
-            "For each reference, also extract the intended structural outcome (`expected_state`).\n\n"
-            "Valid types for expected_state:\n"
-            "- position: indicates where the object should be moved (e.g., 'last', 'first', 'before:[text]', 'after:[text]')\n"
-            "- property: boolean properties (e.g., property: 'include_in_toc', value: false)\n"
-            "- content: general description if it's being replaced or content modified.\n\n"
-            "Return JSON matching this schema:\n"
-            "{\n"
-            "  \"references\": [\n"
-            "    {\n"
-            "      \"text\": \"<the exact phrase used by the user, e.g. 'Conclusion'>\",\n"
-            "      \"expected_state\": [\n"
-            "        { \"type\": \"position\", \"expected\": \"last\" },\n"
-            "        { \"type\": \"property\", \"property\": \"include_in_toc\", \"value\": false }\n"
-            "      ]\n"
-            "    }\n"
-            "  ]\n"
-            "}\n"
-            "If the request does not target specific existing elements, return an empty array."
-        )
-
-        response = self.client.chat.completions.create(
-            model=settings.llm_model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": request},
-            ],
-            temperature=0,
-            max_tokens=512,
-            response_format={"type": "json_object"},
-        )
-
-        raw = (response.choices[0].message.content or "{}").strip()
-        try:
-            data = json.loads(raw)
-            return data.get("references", [])
-        except json.JSONDecodeError:
-            log.error("Failed to decode reference extraction JSON.")
+    def resolve(self, target_hint: str, outline: dict, task_description: str = "") -> list[str]:
+        """Resolve a target hint string to a list of matching element IDs."""
+        if not target_hint:
             return []
 
-    def _flatten_dom(self, node: dict) -> list[dict]:
-        nodes = []
-        if node.get("id"):
-            nodes.append({
-                "id": node["id"],
-                "text": node.get("text", "").strip(),
-                "role": node.get("role", ""),
-                "type": node.get("type", "")
-            })
+        hint_lower = target_hint.lower().strip()
+
+        # Pass 1: Deterministic matching
+        resolved = self._structural_resolve(hint_lower, outline)
+        if resolved:
+            log.info("Pass 1: Deterministic resolve matched target '%s' to: %s", target_hint, resolved)
+            return resolved
+
+        # Pass 2: Semantic fallback (LLM-assisted)
+        resolved = self._semantic_resolve(target_hint, outline, task_description)
+        log.info("Pass 2: Semantic fallback resolved target '%s' to: %s", target_hint, resolved)
+        return resolved
+
+    def _structural_resolve(self, hint: str, outline: dict) -> list[str] | None:
+        indices = outline.get("indices", {})
+        sections = outline.get("sections", [])
+
+        # Match "table of contents" or "toc"
+        if "table of contents" in hint or hint == "toc":
+            for s in sections:
+                if s.get("semantic_type") == "toc":
+                    return [s["heading_id"]]
+            # Return first section if it matches TOC heading
+            if sections and "contents" in sections[0]["heading"].lower():
+                return [sections[0]["heading_id"]]
+
+        # Match ordinals: "table N" or "table number N"
+        table_match = re.search(r"\btable\s*(?:number\s*)?(\d+)\b", hint)
+        if table_match:
+            table_num = table_match.group(1)
+            tbl_id = indices.get("tables_by_ordinal", {}).get(table_num)
+            if tbl_id:
+                return [tbl_id]
+
+        # Match ordinals: "image N" or "image number N" or "figure N" or "figure number N"
+        image_match = re.search(r"\b(?:image|figure|photo)\s*(?:number\s*)?(\d+)\b", hint)
+        if image_match:
+            img_num = image_match.group(1)
+            img_id = indices.get("images_by_ordinal", {}).get(img_num)
+            if img_id:
+                return [img_id]
+
+        # Match "all headings" or "headings"
+        if hint in ("all headings", "headings", "section headings", "heading"):
+            heading_ids = []
+            for s in sections:
+                if s.get("heading_id") and s["heading_id"] != "start":
+                    heading_ids.append(s["heading_id"])
+            if heading_ids:
+                return heading_ids
+
+        # Match "all tables" or "tables"
+        if hint in ("all tables", "tables", "both tables"):
+            return list(indices.get("tables_by_ordinal", {}).values())
+
+        # Match "all images" or "images" or "logos"
+        if hint in ("all images", "images", "both images", "logos", "logo"):
+            return list(indices.get("images_by_ordinal", {}).values())
+
+        # Match "last paragraph" or "last element"
+        if hint in ("last paragraph", "last element", "end of document", "the end"):
+            last_id = indices.get("last_element_id")
+            if last_id:
+                return [last_id]
+
+        # Match "first paragraph" or "first element"
+        if hint in ("first paragraph", "first element", "beginning of document", "the beginning"):
+            first_id = indices.get("first_content_id")
+            if first_id:
+                return [first_id]
+
+        # Match exact heading name
+        exact_id = indices.get("headings_by_name", {}).get(hint)
+        if exact_id:
+            return [exact_id]
         
-        for child in node.get("children", []) + node.get("rows", []) + node.get("cells", []):
-            nodes.extend(self._flatten_dom(child))
-            
-        return nodes
+        # Try substring match on heading names (e.g. "highlights" matching "Key Highlights")
+        for name, h_id in indices.get("headings_by_name", {}).items():
+            if hint in name or name in hint:
+                return [h_id]
 
-    def _fuzzy_match(self, query: str, flat_nodes: list[dict]) -> tuple[str | None, int]:
-        best_id = None
-        best_score = 0
+        # Match "slide N" or "slide number N" (for PPTX)
+        slide_match = re.search(r"\bslide\s*(?:number\s*)?(\d+)\b", hint)
+        if slide_match:
+            slide_num = slide_match.group(1)
+            slide_id = indices.get("slides_by_index", {}).get(slide_num)
+            if slide_id:
+                return [slide_id]
+
+        return None
+
+    def _semantic_resolve(self, target_hint: str, outline: dict, task_description: str = "") -> list[str]:
+        llm = self._llm or LLMClient()
+
+        # Build a list of candidate elements for the LLM to choose from
+        candidates = []
+        for s in outline.get("sections", []):
+            if s.get("heading_id") and s["heading_id"] != "start":
+                candidates.append({
+                    "id": s["heading_id"],
+                    "type": "heading",
+                    "text": s["heading"],
+                })
+            for el in s.get("elements", []):
+                if el.get("type") in ("paragraph", "table", "image"):
+                    candidates.append({
+                        "id": el["id"],
+                        "type": el["type"],
+                        "text": el.get("text_preview", ""),
+                        "ordinal_label": el.get("ordinal_label", ""),
+                    })
+
+        # Cut down candidate list to prevent token overload
+        candidates = candidates[:150]
+
+        import json
+        system_prompt = (
+            "You are a document target resolver.\n"
+            "Given a target description (how the user referred to some part of the document) "
+            "and a list of all elements in the document, identify the element ID(s) that "
+            "the user is targeting.\n\n"
+            "CRITICAL RULES:\n"
+            "1. Choose ONLY from the list of provided elements. Do NOT invent IDs.\n"
+            "2. If the user targets a section (e.g. 'the executive summary'), return ALL element IDs contained within that section (e.g. the heading ID, followed by all paragraphs, tables, images, etc. in that section).\n"
+            "3. If the user targets a specific paragraph (e.g. 'the paragraph about revenue growth'), return the ID of that paragraph.\n"
+            "4. Return multiple IDs ONLY if the reference clearly targets multiple elements (e.g. 'all paragraphs in section X', or 'the entire section').\n"
+            "5. The provided elements may lack explicit types (e.g., all elements might be marked as 'paragraph'). You MUST infer semantic roles (headings, list items, etc.) based on the actual 'text' content and structural patterns (like short phrases followed by multiple sentences).\n\n"
+            "Return a JSON object with a single key 'ids' containing an array of matched element IDs:\n"
+            "{\n"
+            '  "ids": ["id_1", "id_2"]\n'
+            "}"
+        )
+
+        user_prompt = (
+            f"Task context: {task_description}\n"
+            f"Target hint: {target_hint}\n\n"
+            f"Candidate document elements:\n{json.dumps(candidates, indent=2)}"
+        )
+
+        import logging
+        log = logging.getLogger(__name__)
         
-        query_lower = query.lower()
+        response = llm.complete(LLMRequest(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            temperature=0,
+            max_tokens=4096,
+            json_mode=True,
+        ))
 
-        for node in flat_nodes:
-            text = node["text"]
-            if not text:
-                continue
-                
-            # Exact match gets 100
-            if text.lower() == query_lower:
-                return node["id"], 100
-                
-            # Otherwise use partial ratio (simulated with difflib)
-            seq = difflib.SequenceMatcher(None, query_lower, text.lower())
-            # A rough estimate of partial ratio
-            score = seq.ratio() * 100
-            
-            # Boost score if the role matches typical queries (e.g. "heading")
-            if "heading" in query_lower and node["role"] == "heading":
-                score = min(100, score + 10)
-                
-            if score > best_score:
-                best_score = score
-                best_id = node["id"]
-                
-        return best_id, int(best_score)
-
+        parsed = response.json or {}
+        ids = parsed.get("ids", [])
+        
+        log.warning(f"TARGET_HINT: {target_hint}")
+        log.warning(f"RAW LLM RESPONSE: {response.text}")
+        log.warning(f"PARSED JSON: {parsed}")
+        print(f"TARGET_HINT: {target_hint}")
+        print(f"RAW LLM RESPONSE: {response.text}")
+        print(f"PARSED JSON: {parsed}")
+        
+        return [str(i) for i in ids if isinstance(i, str)]

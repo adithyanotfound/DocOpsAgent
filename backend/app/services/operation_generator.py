@@ -1,535 +1,377 @@
-"""Operation Generator — LLM-powered node that converts a user request into
-a list of structured document operations.
+"""Operation Generator — generates structured document operations.
 
-This replaces `generate_edits` for the 'operations' pipeline branch, which
-covers everything except plain text rewrites and full deck generation:
-
-  - Rich text formatting (bold, font, color, alignment, …)
-  - Table CRUD
-  - Image insertion / replacement / resizing
-  - Shape / text-box manipulation
-  - Theme, background, color changes
-  - Slide-level operations (add, delete, duplicate, reorder)
-  - Chart editing
-  - AI-driven design normalization
-
-The LLM is given a compact JSON representation of the document structure
-and produces an operation list that the DocumentProcessor can execute.
+Supports two pipelines:
+1. Legacy Pipeline: single-shot operations generation for the entire request.
+2. New staged Pipeline: generates operations for a single focused task at a time.
 """
 from __future__ import annotations
 
 import json
 import logging
+from datetime import datetime
+from typing import Any
 
 from app.core.config import settings
-from app.services.operations import needs_image_response, validate_operation
+from app.services.llm_client import LLMClient, LLMRequest
+from app.services.operations import validate_operation, needs_image_response
+from app.services.outline_builder import OutlineBuilder
 
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Prompt building helpers
+# Per-task JSON schemas for Phase 4
 # ---------------------------------------------------------------------------
 
-_OPERATION_SCHEMA = """
-Available operation types and their parameter schemas:
-
-1. text_edit — Rewrite text content (with optional inline formatting for the replaced text)
-   target_id: string (ID of the paragraph, text box, or cell from the DOM)
-   parameters: {new_text, bold, italic, underline, font_family, font_size_pt, color_hex}
-
-2. text_format — Apply formatting to a paragraph or run
-   target_id: string (ID of the paragraph or run from the DOM, or "all" to apply globally across the document)
-   parameters: {bold, italic, underline, strikethrough, font_family,
-                font_size_pt, color_hex (6-char hex WITHOUT '#', e.g. "FF0000" for red),
-                highlight_hex, match_color_hex (6-char hex WITHOUT '#', ONLY apply if existing color matches this approx hex),
-                match_text (exact substring to apply formatting to inside the target paragraph),
-                match_role (e.g. "heading", "body", "bullet_point" - ONLY used when target_id is "all"),
-                alignment ("left"|"center"|"right"|"justify"),
-                space_before_pt (float), space_after_pt (float),
-                line_spacing (multiplier), char_spacing (pt),
-                superscript, subscript, shadow, page_break_before (boolean — DOCX only, makes the paragraph start on a new page),
-                include_in_toc (boolean — DOCX only, sets whether a heading appears in the Table of Contents)
-                IMPORTANT: alignment, line_spacing, space_before_pt, space_after_pt, page_break_before, and include_in_toc are PARAGRAPH-LEVEL properties. They CANNOT be used with match_text. If you need to right-align a specific line inside a multi-line paragraph (like a Date), you must use text_edit to replace the paragraph text, adding tabs (\t) before the date to push it to the right.}
-
-3. table_op — Table CRUD
-   target_id: string (ID of the table from the DOM, "all" for all tables, or null to create new)
-   parameters: {
-     action: "create"|"delete"|"add_row"|"remove_row"|"add_col"|"remove_col"
-             |"merge_cells"|"set_cell_bg"|"set_borders"|"alternate_rows"
-             |"populate"|"set_header_format"|"sort_data"|"set_cell_alignment"|"apply_theme"
-             |"set_alignment"|"set_width_pct",
-     rows, cols, header_row, alternate_row_colors [hex1, hex2], theme_color_hex,
-     data [[row1col1, ...], ...] (For add_col/add_row with a title, provide it in data, e.g. ["Q3"]), 
-     row_index, col_index (Must provide these for populate to target the correct row/col, e.g., last column),
-     merge_from [row,col], merge_to [row,col],
-     cell_bg_hex, border_color_hex, border_width_pt,
-     position {left_pct, top_pct, width_pct, height_pct},
-     cell_padding_pt, cell_alignment, alignment ("left"|"center"|"right" - for set_alignment),
-     width_pct (float, e.g. 1.0 for 100% width - for set_width_pct)
-   }
-
-4. image_op — Image operations
-   target_id: string (ID of the image shape from the DOM, or null for new)
-   parameters: {
-     action: "insert"|"replace"|"remove"|"resize"|"reposition"|"rotate"
-             |"bring_forward"|"send_backward"|"set_transparency"
-             |"set_border"|"rounded_corners"|"shadow"
-             |"add_caption",    — [DOCX] Insert a caption paragraph below the image
-     image_path (provided by system if image attached),
-
-     [PPTX] position {{left_pct, top_pct, width_pct, height_pct}},
-     [PPTX] maintain_aspect_ratio, rotation_degrees, transparency_pct (0-100),
-     [PPTX] border_color_hex, border_width_pt, rounded_corners, shadow,
-     [PPTX] crop {{top_pct, left_pct, right_pct, bottom_pct}}
-
-     [DOCX] after_id: string        — body_index DOM id to insert image AFTER (for action="insert")
-     [DOCX] width_page_pct: float   — image width as fraction of usable page width (e.g. 0.4 = 40%)
-     [DOCX] alignment: "left"|"center"|"right"  — horizontal alignment of the image paragraph
-     [DOCX] float_position: "left"|"right"|"inline"  — floating layout; use "inline" for no float
-     [DOCX] caption_text: string    — caption text for add_caption action
-     [DOCX] caption_style: string   — Word style name for caption (default: "Caption")
-     [DOCX] alt_text: string        — short description/name of the inserted image (e.g. "Company Logo") to retain context
-   }
-
-   DOCX examples:
-     Insert logo after title (paragraph_0), 30% page wide, centered:
-       {{"op_type": "image_op", "target_id": null, "parameters": {{"action": "insert", "image_path": "<from attached>", "after_id": "paragraph_0", "width_page_pct": 0.3, "alignment": "center", "alt_text": "Company Logo"}}}}
-
-     Place an image IN THE SAME LINE as the title (e.g. right next to the centered text):
-       {{"op_type": "image_op", "target_id": "paragraph_0", "parameters": {{"action": "insert_into_paragraph", "image_path": "<from attached>", "width_page_pct": 0.2, "alt_text": "Small Logo"}}}}
-
-     Replace text placeholder (paragraph_4) with an image:
-       {{"op_type": "image_op", "target_id": "paragraph_4", "parameters": {{"action": "replace_text", "image_path": "<from attached>", "width_page_pct": 0.5, "alt_text": "Sales Chart"}}}}
-
-     Replace image_0 with a new image at 50% page width:
-       {{"op_type": "image_op", "target_id": "image_0", "parameters": {{"action": "replace", "image_path": "<from attached>", "width_page_pct": 0.5}}}}
-
-     Resize image_0 to 40% page width (preserve aspect ratio):
-       {{"op_type": "image_op", "target_id": "image_0", "parameters": {{"action": "resize", "width_page_pct": 0.4, "maintain_aspect_ratio": true}}}}
-
-     Move image_0 to the right (right-align its paragraph) (USE THIS FOR "TOP RIGHT" OR "BOTTOM RIGHT" REQUESTS):
-       {{"op_type": "image_op", "target_id": "image_0", "parameters": {{"action": "reposition", "alignment": "right"}}}}
-
-     Center image_0:
-       {{"op_type": "image_op", "target_id": "image_0", "parameters": {{"action": "reposition", "alignment": "center"}}}}
-
-     Add caption below image_0:
-       {{"op_type": "image_op", "target_id": "image_0", "parameters": {{"action": "add_caption", "caption_text": "Figure 1: Quarterly Sales"}}}}
-
-5. shape_op — Shape / text box operations
-   target_id: string (ID of the shape from the DOM)
-   parameters: {
-     action: "add_textbox"|"delete"|"resize"|"move"|"rotate"|"duplicate"
-             |"set_fill"|"set_outline"|"set_transparency"|"group"|"ungroup"
-             |"bring_forward"|"send_backward"|"align"|"distribute",
-     text, position {left_pct, top_pct, width_pct, height_pct},
-     fill_color_hex, outline_color_hex, outline_width_pt,
-     transparency_pct, rotation_degrees, corner_radius_pt,
-     group_shape_indices [list of strings for group/ungroup]
-   }
-
-6. theme_op — Background, color, margin, and page-number changes
-   target_id: null (or "all")
-   parameters: {
-     action: "set_bg_color"|"set_bg_gradient"|"apply_theme_colors"|"corporate_branding"
-             |"set_margins"         — [DOCX] Set all page margins. Required: margin_inches (float, e.g. 1.5)
-             |"add_page_numbers",   — [DOCX] Add centered page numbers to the footer of every section
-     scope: "all_slides"|"current_slide",
-     bg_color_hex, gradient_start_hex, gradient_end_hex,
-     gradient_direction ("horizontal"|"vertical"|"diagonal"),
-     accent_colors [list of hex strings],
-     margin_inches (float)  — used with action="set_margins"
-   }
-
-   DOCX examples:
-     Increase margins:    {{"op_type": "theme_op", "target_id": null, "parameters": {{"action": "set_margins", "margin_inches": 1.5}}}}
-     Add page numbers:    {{"op_type": "theme_op", "target_id": null, "parameters": {{"action": "add_page_numbers"}}}}
-
-7. slide_op — Slide-level operations
-   target_id: string (ID of the slide)
-   parameters: {
-     action: "add"|"delete"|"duplicate"|"reorder"|"hide"|"unhide"|"rename_title",
-     after_index (1-based, for add/duplicate),
-     from_index (1-based, for reorder), to_index (1-based, for reorder),
-     layout_name, title (for rename_title)
-   }
-
-8. chart_op — Chart editing
-   target_id: string (ID of the chart shape)
-   parameters: {
-     action: "change_type"|"update_data"|"set_series_colors"|"update_labels"
-             |"update_axis_labels"|"show_legend"|"hide_legend"|"apply_theme",
-     chart_type ("bar"|"line"|"pie"|"scatter"|"column"),
-     series_colors [hex list], data [[...]], legend_position,
-     x_axis_label, y_axis_label, data_labels_visible
-   }
-
-9. ai_design_op — AI-driven design normalization
-   target_id: null
-   parameters: {
-     action: "normalize_fonts"|"normalize_spacing"|"improve_hierarchy"
-             |"balance_whitespace"|"remove_overlaps"|"auto_resize_text"
-             |"make_consistent"|"generate_speaker_notes"
-             |"improve_readability"|"detect_clutter",
-     scope ("all_slides"|"slide_X"), target_font, base_font_size_pt
-   }
-
-10. needs_image — Signal that an image must be attached
-    Use ONLY when user wants to explicitly insert or replace an image (action="insert", "insert_into_paragraph", "replace", or "replace_text") AND no image_path is provided in the system prompt.
-    DO NOT use needs_image for reposition, resize, or add_caption actions—those apply to existing images!
-    parameters: {message: "friendly message asking user to attach image"}
-
-11. layout_op — [DOCX ONLY] Structural layout changes: move sections or insert page breaks
-    target_id: null
-    parameters: {
-      action: "move_block"        — Move a contiguous block of paragraphs/tables to a new position
-              |"insert_page_break" — Insert a hard page break immediately before a target element
-              |"duplicate_block"  — Clone a section (from start_id to end_id) and insert it
-              |"remove_block"     — Delete an entire section (from start_id to end_id)
-              |"insert_block"     — Create a brand new section from scratch using a data array
-              |"insert_toc"       — Insert a native Word Table of Contents field
+_TEXT_EDIT_SCHEMA = """Return a JSON array of text_edit operations:
+[
+  {
+    "op_type": "text_edit",
+    "target_id": "element_id_to_edit" or ["id1", "id2"],
+    "parameters": {
+      "new_text": "The complete new rewritten text content"
     }
-
-    For action="move_block", "duplicate_block", "remove_block":
-      start_id: string   — DOM id of the FIRST element in the block to move/copy/delete (e.g. "paragraph_5")
-      end_id: string     — DOM id of the LAST element in the block. Include ALL paragraphs between the heading and the next heading/section.
-      before_id: string  — (move/copy only) DOM id of the element to insert the block BEFORE
-      after_id: string   — (move/copy only) OR use this to insert AFTER. To move a block to the VERY END of the document, set `after_id` to the ID of the last element in the document.
-
-    For action="insert_page_break", "insert_toc":
-      before_id: string  — DOM id of the element to insert BEFORE
-      after_id: string   — OR DOM id of the element to insert AFTER
-
-    For action="insert_block":
-      before_id: string  — DOM id of the element to insert BEFORE
-      after_id: string   — OR DOM id of the element to insert AFTER
-      data: array        — The paragraphs to insert. E.g. [{"role": "heading", "text": "New Title", "heading_level": 1}, {"role": "body", "text": "Some text"}]
-
-    DOCX examples:
-      Move "Action Items" section (paragraph_5 through paragraph_9) to appear before "Highlights" section (paragraph_2):
-        {{"op_type": "layout_op", "target_id": null, "parameters": {{"action": "move_block", "start_id": "paragraph_5", "end_id": "paragraph_9", "before_id": "paragraph_2"}}}}
-
-      Insert a page break before the "Action Items" heading (paragraph_5):
-        {{"op_type": "layout_op", "target_id": null, "parameters": {{"action": "insert_page_break", "before_id": "paragraph_5"}}}}
-
-12. list_op — [DOCX ONLY] List manipulation: convert format, add/sort items, change bullet char
-    target_id: null
-    parameters: {{
-      action: "convert_type"   — Change list format for a range (bullet→numbered, any→checklist, etc.)
-              |"add_items"     — Insert new list items after an anchor paragraph
-              |"sort_items"    — Alphabetically sort list paragraphs in a range
-              |"set_bullet_char" — Change the bullet character for a list range
-    }}
-
-    For action="convert_type":
-      start_id: string   — DOM id of the FIRST list paragraph to convert
-      end_id: string     — DOM id of the LAST list paragraph to convert
-      list_type: "bullet" | "numbered" | "checklist"
-      bullet_char: string (optional, custom bullet character)
-
-    For action="add_items":
-      after_id: string   — DOM id of the list paragraph to insert NEW items AFTER
-      end_id: string     — DOM id of the LAST existing item in the list (for style cloning)
-      items: ["text1", "text2", ...]  — text for each new list item
-
-    For action="sort_items":
-      start_id: string   — DOM id of the first list paragraph to sort
-      end_id: string     — DOM id of the last list paragraph to sort
-      order: "asc" | "desc"  (default: "asc")
-
-    For action="set_bullet_char":
-      start_id: string   — first list paragraph
-      end_id: string     — last list paragraph
-      char: string       — the bullet character (e.g. "•", "–", "☐")
-
-    DOCX examples:
-      Convert bullet list (paragraph_3 to paragraph_6) to numbered:
-        {{"op_type": "list_op", "target_id": null, "parameters": {{"action": "convert_type", "start_id": "paragraph_3", "end_id": "paragraph_6", "list_type": "numbered"}}}}
-
-      Add 3 business highlights after the last bullet (paragraph_6):
-        {{"op_type": "list_op", "target_id": null, "parameters": {{"action": "add_items", "after_id": "paragraph_6", "end_id": "paragraph_6", "items": ["Global expansion into 5 new markets", "Customer satisfaction score of 94%", "Zero critical security incidents"]}}}}
-
-      Sort list items paragraph_3 through paragraph_8 alphabetically:
-        {{"op_type": "list_op", "target_id": null, "parameters": {{"action": "sort_items", "start_id": "paragraph_3", "end_id": "paragraph_8", "order": "asc"}}}}
-
-      Convert list (paragraph_3 to paragraph_8) to a checklist (☐ prefix):
-        {{"op_type": "list_op", "target_id": null, "parameters": {{"action": "convert_type", "start_id": "paragraph_3", "end_id": "paragraph_8", "list_type": "checklist"}}}}
-
-13. find_replace — [DOCX ONLY] Global or targeted find and replace
-    target_id: string (DOM id of paragraph/table to restrict scope, or "all" for global document replace)
-    parameters: {{
-      find_text: string (The exact text or regular expression to find)
-      replace_text: string (The text to replace it with)
-      is_regex: boolean (Optional, default false. Set to true if find_text is a regex pattern)
-      match_case: boolean (Optional, default false)
-    }}
-
-    DOCX examples:
-      Replace "Revenue" with "Net Revenue" everywhere in the document:
-        {{"op_type": "find_replace", "target_id": "all", "parameters": {{"find_text": "Revenue", "replace_text": "Net Revenue"}}}}
-
-      Replace all years starting with 202 (e.g. 2024, 2025) with "2026":
-        {{"op_type": "find_replace", "target_id": "all", "parameters": {{"find_text": "202[0-9]", "replace_text": "2026", "is_regex": true}}}}
+  }
+]
 """
 
-
-_SYSTEM_PROMPT = f"""You are a precise document editing assistant that converts user instructions
-into structured JSON operation lists based on the provided Document Object Model (DOM).
-
-RULES:
-1. Return ONLY a valid JSON array of operation objects. No commentary, no markdown fences.
-2. Each operation has exactly: "op_type", "target_id", "parameters".
-3. Use the stable IDs provided in the DOM to set "target_id".
-4. Be surgical — only produce operations that are necessary and will make a VISIBLE, 
-   MEANINGFUL improvement. Do not add random changes.
-5. If the user asks to insert/replace an image and "image_path" is null, you MUST
-   return a single "needs_image" operation asking for attachment.
-6. CRITICAL: color_hex must be a plain 6-character hex string WITHOUT the '#' prefix.
-   Example: red = "FF0000", blue = "0000FF", green = "008000".
-7. CRITICAL: DO NOT invent IDs. You must use the exact `target_id`s provided in the Document structure.
-8. CRITICAL: For global formatting targeting specific types of content (e.g. "Make all headings blue", "Center all section headings", "Format body text", "Italicize bullet points"), you MUST ALWAYS use `target_id: "all"` and provide `match_role` in `text_format` using the exact role from the structure hints (e.g. "heading", "body", "bullet_point"). NEVER generate separate operations for each paragraph if the request says "all" or "every"! For global formatting based on an EXISTING color, use `target_id: "all"` and provide `match_color_hex` using the exact hex code from the structure hints. For global table operations (e.g. "Change all tables to blue"), use `table_op` with `target_id: "all"`. This guarantees 100% coverage across the document without hitting operation limits. Example: {{"op_type": "text_format", "target_id": "all", "parameters": {{"italic": true, "match_role": "bullet_point"}}}}
-9. Always apply formatting to EVERY matching paragraph — if the user says
-   "heading AND subheading", produce one operation per target paragraph (unless using "all").
-10. Never produce empty arrays unless the request is genuinely impossible; then produce
-    a single ai_design_op with action "detect_clutter" and explain in parameters.
-11. If the user asks to format a specific word or phrase (e.g., "Change [Client Name] to green bold"), you MUST produce a `text_format` operation and provide the `match_text` parameter with the exact substring (e.g., "[Client Name]"). Do NOT use `text_edit` for this unless you are actually changing the words themselves. By providing `match_text` to `text_format`, the backend will surgically apply the formatting ONLY to that specific phrase.
-12. CRITICAL: If the user provides a multi-step prompt (e.g. do X, Y, and Z), you MUST return an array containing multiple operations that fulfill EVERY part of the request. Do not stop after 1 or 2 operations. You can generate as many operations as needed to fulfill the entire prompt.
-13. If the user asks to update a date to today's date, you MUST use the exact CURRENT_DATE provided below. Do not hallucinate random dates. Do NOT output invalid actions or parameters. Stick STRICTLY to the schemas above.
-14. When the user asks to modify multiple rows or specific cells in a table, DO NOT use a single table_op with 'set_header_format' unless they only asked for headers. You MUST iterate and generate a 'text_edit' or 'text_format' operation for EACH cell/paragraph you wish to modify, targeting its specific DOM ID.
-15. If asked to apply a change globally, find all relevant IDs in the DOM and generate an operation for each, OR use target_id: "all" if the schema supports it.
-16. CRITICAL: For text formatting (text_format) across all headings, bodies, or the entire document, you MUST use `target_id: "all"` and `match_role`. DO NOT output a separate text_format operation for each paragraph! This will exceed output token limits.
-17. To remove a heading from the Table of Contents or prevent a new heading from appearing in it, you MUST use a `text_format` operation on the heading's target ID and set `include_in_toc: false`. Do NOT pass `include_in_toc` inside the data array of an `insert_block` operation, as it is invalid there.
-17. CRITICAL: DO NOT repeat the same operation multiple times. Once you have generated the operations for all steps in the user's prompt, YOU MUST close the JSON array `]` and STOP generating.
-
-DOCX-SPECIFIC RULES (apply when the document type is DOCX):
-18. The Document structure shows elements in TRUE DOCUMENT ORDER with a `body_index` field. Use `body_index` to understand which section comes before/after another.
-19. To MOVE a section in a DOCX (e.g. "Move Action Items above Highlights"):
-    - Use `layout_op` with `action: "move_block"`.
-    - `start_id` = the DOM id of the section heading paragraph to move.
-    - `end_id` = the DOM id of the LAST paragraph/table that belongs to that section (stop before the next heading).
-    - `before_id` = the DOM id of the element you want the block inserted before.
-    - Use the `body_index` values in the structure to correctly determine start/end/before IDs.
-20. To INSERT A PAGE BREAK before a section in a DOCX:
-    - Use `layout_op` with `action: "insert_page_break"` and `before_id` = the DOM id of the heading paragraph.
-    - Alternatively, use `text_format` with `page_break_before: true` on the heading paragraph.
-    - PREFER `insert_page_break` when the request explicitly says "insert a page break".
-    - Use `text_format` with `page_break_before: true` when the request says "start on a new page" or "headings on new pages".
-21. To INCREASE PAGE MARGINS in a DOCX: use `theme_op` with `action: "set_margins"` and `margin_inches` (e.g. 1.5 for 1.5-inch margins).
-22. To ADD PAGE NUMBERS to a DOCX footer: use `theme_op` with `action: "add_page_numbers"`.
-23. For multi-step DOCX structural requests (move + page break + margins + page numbers), produce ALL required operations in one JSON array.
-
-FINAL COMPLETENESS CHECK (MANDATORY — do this before closing the JSON array):
-Before you write the closing `]`, mentally review the user's original request and verify:
-  - Is EVERY distinct sub-task (reorganize, convert list, format headings, etc.) covered by at least one operation?
-  - If you find a sub-task with no operations, ADD the missing operations NOW before closing.
-  - Only close the array when every sub-task has been addressed.
-  - This check is CRITICAL for multi-step prompts.
-
-DOCX IMAGE RULES (apply when document type is DOCX and request involves images):
-24. In DOCX, images are identified by `image_N` DOM IDs in the structure (e.g. 'image_0', 'image_1'). Use these as `target_id` for image operations.
-25. To INSERT a new image into a DOCX:
-    - Use `image_op` with `action: "insert"`, set `after_id` to the DOM id of the element AFTER which the image should appear.
-    - Set `width_page_pct` (e.g. 0.3 = 30% of page width) and `alignment` ("left", "center", or "right").
-    - `image_path` MUST be the value provided under "Attached image path" in the prompt. If no image is attached, use `needs_image` instead.
-26. To REPLACE an existing image (e.g. replace a placeholder):
-    - Use `image_op` with `action: "replace"` and `target_id: "image_0"` (or whichever image the user refers to).
-    - Set `width_page_pct` to preserve or change the image size.
-27. To RESIZE an image in a DOCX:
-    - Use `image_op` with `action: "resize"`, `target_id: "image_N"`, and `width_page_pct` (e.g. 0.4 = 40%).
-    - Always include `"maintain_aspect_ratio": true` unless the user explicitly wants distortion.
-28. To MOVE/ALIGN an image horizontally in DOCX (left, center, right side of page):
-    - Use `image_op` with `action: "reposition"`, `target_id: "image_N"`, and `alignment: "right"` (or "center"/"left").
-    - If the user says "float to the right" or "wrap text around image", add `"float_position": "right"`.
-29. To ADD A CAPTION below an image in DOCX:
-    - Use `image_op` with `action: "add_caption"`, `target_id: "image_N"`, and `caption_text: "Figure 1: ..."` .
-    - The caption is automatically styled with the Word 'Caption' style and centered.
-30. For multi-step DOCX image requests (insert + resize + reposition + caption), produce ALL operations in one JSON array in logical order: insert first, then resize, then reposition, then caption.
-
-DOCX LIST RULES (apply when document type is DOCX and request involves lists):
-31. In DOCX, list paragraphs are identified in the structure with `role='bullet_point'` and include a `list_info` field showing `num_id`, `ilvl`, `list_type` ('bullet'/'numbered'/'checklist'), and `lvl_text`.
-32. To CONVERT a bullet/numbered list: use `list_op` with `action: "convert_type"`, `start_id` = first list item DOM id, `end_id` = last list item DOM id, `list_type` = target format.
-    - For "numbered list": `list_type: "numbered"`
-    - For "checklist" or "checkbox list": `list_type: "checklist"`
-    - For "bullet list": `list_type: "bullet"`
-33. To ADD NEW ITEMS to a list: use `list_op` with `action: "add_items"`, `after_id` = DOM id of the LAST existing list item, `end_id` = same last item (for style cloning), and `items` = array of text strings for new items.
-    - ALWAYS include all new item texts in the `items` array. Do NOT generate separate operations per item.
-    - If the user asks to add N items, the `items` array MUST contain exactly N strings.
-34. To SORT list items: use `list_op` with `action: "sort_items"`, `start_id` = first item, `end_id` = last item, `order` = "asc" or "desc".
-    - After sorting, the physical paragraph IDs change order but the DOM IDs stay the same (they refer to position slots, not text content).
-35. To CONVERT A LIST TO CHECKLIST: use `list_op` with `action: "convert_type"` and `list_type: "checklist"`. This sets a ☐ (ballot box) as the bullet character.
-36. For multi-step list requests (e.g. convert + add items + sort + convert to checklist), produce ALL operations in one JSON array in LOGICAL ORDER:
-    - First: `convert_type` (change the list format)
-    - Then: `add_items` (add new items — use the ORIGINAL last item id from the structure, not a new id)
-    - Then: `sort_items` (use the ORIGINAL first and last item ids from the structure)
-    - Then: another `convert_type` if format changes again (e.g., to checklist)
-    - IMPORTANT: All start_id/end_id values in sort_items MUST cover the full list including newly added items. Since add_items inserts AFTER end_id, and sort_items needs to cover all items, for sort_items use the same start_id as the first item and end_id as the original last item (the new items will be inserted after it and also be covered by the sort if they share the same parent region).
-    - NOTE: After add_items, the new paragraphs do NOT have stable DOM IDs yet (they were inserted dynamically). Use the sort_items operation on the original range — the backend sorts all list paragraphs found between start_id and end_id including newly inserted ones.
-
-DOCX GENERATIVE CONTENT RULES (apply when user asks to ADD new sections, duplicate, remove, or add Table of Contents):
-
-37. To ADD A NEW SECTION (e.g. "Add a Conclusion section", "Insert a Risks and Challenges section"):
-    - Use `layout_op` with `action: "insert_block"`.
-    - Set `after_id` to the DOM id of the LAST paragraph of the preceding section. If adding at the end, use the last paragraph in the document.
-    - Set `before_id` to the DOM id of the first paragraph of the FOLLOWING section, if inserting in the middle of the document.
-    - The `data` array MUST contain:
-      a. A heading item: {{"role": "heading", "text": "<Section Title>", "heading_level": 2}}
-      b. At least 2 body items with descriptive placeholder text starting with '[placeholder]': {{"role": "body", "text": "[placeholder] <a 1-2 sentence description of what this section should contain>"}}
-    - IMPORTANT: The ContentEnricher will replace the body text with rich, contextually appropriate content. Just make the heading correct and provide a meaningful 1-sentence description in each body item starting with '[placeholder]' so the enricher knows what to write.
-    - NEVER use `data: []` (empty array) — always include at least a heading item.
-
-38. To ADD A TABLE OF CONTENTS:
-    - Use `layout_op` with `action: "insert_toc"`.
-    - Set `before_id` to the DOM id of the FIRST content paragraph in the document (to insert the ToC at the very beginning).
-    - The system will automatically build a visible table from the document's actual headings. You do NOT need to provide data.
-
-39. To DUPLICATE A SECTION (e.g. "Duplicate the Key Metrics section"):
-    - Use `layout_op` with `action: "duplicate_block"`.
-    - `start_id` = DOM id of the section's heading paragraph.
-    - `end_id` = DOM id of the LAST paragraph/table belonging to that section (stop before the next heading).
-    - `after_id` = DOM id of the `end_id` element (to insert the copy immediately after the original).
-
-40. To REMOVE A SECTION (e.g. "Remove the Formatting Playground section"):
-    - Use `layout_op` with `action: "remove_block"`.
-    - `start_id` = DOM id of the section's heading paragraph.
-    - `end_id` = DOM id of the LAST paragraph/table belonging to that section (stop before the next heading).
-    - Use the `body_index` field in the structure to find the boundaries: the section ends just before the paragraph with the next lower or equal heading level.
-
-41. For "find and replace" or "replace all occurrences" tasks, use `find_replace` with `target_id: "all"`.
-    - Set `is_regex: true` if you are using regex in `find_text` (e.g. replacing all dates, phone numbers).
-    - If the user generically asks to replace a "placeholder" (e.g. "change the date placeholder"), you MUST look at the provided DOM to find the exact text of the placeholder (like "[DD Month YYYY]", "<Date>", etc.) and use that exact string (or a regex) in `find_text`.
-
-
-
-CURRENT DATE: {{CURRENT_DATE}}
-
-{_OPERATION_SCHEMA}
+_TEXT_FORMAT_SCHEMA = """Return a JSON array of text_format operations:
+[
+  {
+    "op_type": "text_format",
+    "target_id": "element_id_to_format" or ["id1", "id2"],
+    "parameters": {
+      "bold": true/false/null,
+      "italic": true/false/null,
+      "underline": true/false/null,
+      "font_family": "Arial"/"Calibri"/null,
+      "font_size_pt": 11.5 or null,
+      "color_hex": "0000FF" (6-char hex) or null,
+      "highlight_hex": "FFFF00" (6-char hex) or null,
+      "alignment": "left"/"center"/"right"/"justify" or null,
+      "line_spacing": 1.5 or null,
+      "char_spacing": 1.0 or null
+    }
+  }
+]
 """
 
+_TABLE_OP_SCHEMA = """Return a JSON array of table_op operations:
+[
+  {
+    "op_type": "table_op",
+    "target_id": "table_element_id_or_null" or ["id1", "id2"],
+    "parameters": {
+      "action": "create"|"delete"|"add_row"|"remove_row"|"add_col"|"remove_col"|"merge_cells"|"set_cell_bg"|"set_borders"|"alternate_rows"|"populate"|"sort_data"|"apply_theme"|"set_header_format",
+      "rows": number_of_rows_or_null,
+      "cols": number_of_cols_or_null,
+      "header_row": true/false/null,
+      "alternate_row_colors": ["FFFFFF", "F0F0F0"] or null,
+      "data": [["cell1", "cell2"], ["cell3", "cell4"]] or null,
+      "row_index": index_or_null,
+      "col_index": index_or_null,
+      "cell_bg_hex": "HEX" or null,
+      "border_color_hex": "HEX" or null,
+      "theme_color_hex": "HEX" or null,
+      "border_width_pt": number_or_null
+    }
+  }
+]
+"""
 
-def _guess_color_name(hex_str: str) -> str:
-    """Guess a basic color name from a hex string to help the LLM."""
-    hex_str = hex_str.lstrip('#')
-    if len(hex_str) != 6: return "unknown"
-    try:
-        r, g, b = int(hex_str[0:2], 16), int(hex_str[2:4], 16), int(hex_str[4:6], 16)
-        if r > 200 and g > 200 and b > 200: return "white"
-        if r < 50 and g < 50 and b < 50: return "black"
-        if abs(r-g) < 20 and abs(g-b) < 20: return "gray"
-        
-        if r > g and r > b: return "red/orange"
-        if g > r and g > b: return "green"
-        if b > r and b > g: return "blue"
-        if r > b and g > b and abs(r-g) < 30: return "yellow"
-    except Exception:
-        pass
-    return "unknown"
+_IMAGE_OP_SCHEMA = """Return a JSON array of image_op operations:
+[
+  {
+    "op_type": "image_op",
+    "target_id": "image_element_id_or_null" or ["id1", "id2"],
+    "parameters": {
+      "action": "insert"|"replace"|"remove"|"resize"|"reposition"|"rotate"|"rounded_corners"|"shadow",
+      "image_path": "path_to_image_or_placeholder_or_null",
+      "position": {
+        "left_pct": 0.1,
+        "top_pct": 0.2,
+        "width_pct": 0.4,
+        "height_pct": 0.5
+      },
+      "maintain_aspect_ratio": true/false/null,
+      "rotation_degrees": number_or_null,
+      "border_color_hex": "HEX" or null,
+      "border_width_pt": number_or_null,
+      "rounded_corners": true/false/null,
+      "shadow": true/false/null
+    }
+  }
+]
+"""
+
+_LAYOUT_OP_SCHEMA = """Return a JSON array of layout_op operations:
+[
+  {
+    "op_type": "layout_op",
+    "target_id": null,
+    "parameters": {
+      "action": "move_block"|"insert_page_break"|"remove_block"|"duplicate_block"|"insert_block"|"insert_toc",
+      "start_id": "id_of_first_element_to_move_or_remove",
+      "end_id": "id_of_last_element_to_move_or_remove",
+      "before_id": "id_of_anchor_to_insert_before",
+      "after_id": "id_of_anchor_to_insert_after",
+      "data": [
+        {"role": "heading", "text": "Heading text", "heading_level": 2},
+        {"role": "body", "text": "Paragraph content text"}
+      ]
+    }
+  }
+]
+"""
+
+_LIST_OP_SCHEMA = """Return a JSON array of list_op operations:
+[
+  {
+    "op_type": "list_op",
+    "target_id": null,
+    "parameters": {
+      "action": "convert_type"|"add_items"|"sort_items"|"set_bullet_char",
+      "start_id": "first_item_element_id_or_null",
+      "end_id": "last_item_element_id_or_null",
+      "anchor_id": "insert_after_this_element_id_or_null",
+      "list_type": "bullet"|"numbered"|"checklist",
+      "items": ["list item 1 text", "list item 2 text"],
+      "bullet_char": "char_or_null"
+    }
+  }
+]
+"""
+
+_FIND_REPLACE_SCHEMA = """Return a JSON array of find_replace operations:
+[
+  {
+    "op_type": "find_replace",
+    "target_id": "all",
+    "parameters": {
+      "find_text": "text_to_find",
+      "replace_text": "text_to_replace_with",
+      "is_regex": false,
+      "match_case": false
+    }
+  }
+]
+"""
+
+_THEME_OP_SCHEMA = """Return a JSON array of theme_op operations:
+[
+  {
+    "op_type": "theme_op",
+    "target_id": null,
+    "parameters": {
+      "action": "set_bg_color"|"set_margins"|"add_page_numbers"|"apply_theme_colors",
+      "bg_color_hex": "HEX_or_null",
+      "margin_inches": number_or_null,
+      "accent_colors": ["HEX1", "HEX2"] or null
+    }
+  }
+]
+"""
+
+_SLIDE_OP_SCHEMA = """Return a JSON array of slide_op operations (PPTX only):
+[
+  {
+    "op_type": "slide_op",
+    "target_id": "slide_id_or_null" or ["id1", "id2"],
+    "parameters": {
+      "action": "add"|"delete"|"duplicate"|"reorder"|"hide"|"unhide"|"rename_title"|"apply_layout",
+      "after_index": 1_based_index_or_null,
+      "from_index": 1_based_index_or_null,
+      "to_index": 1_based_index_or_null,
+      "layout_name": "layout_name_or_null",
+      "title": "new_title_or_null"
+    }
+  }
+]
+"""
+
+_AI_DESIGN_OP_SCHEMA = """Return a JSON array of ai_design_op operations:
+[
+  {
+    "op_type": "ai_design_op",
+    "target_id": null,
+    "parameters": {
+      "action": "normalize_fonts"|"normalize_spacing"|"improve_hierarchy"|"balance_whitespace"|"remove_overlaps"|"improve_readability",
+      "scope": "all_slides"|"slide:1" or null,
+      "target_font": "Calibri" or null,
+      "base_font_size_pt": 11 or null
+    }
+  }
+]
+"""
+
+_SCHEMA_BY_TYPE = {
+    "text_edit": _TEXT_EDIT_SCHEMA,
+    "text_format": _TEXT_FORMAT_SCHEMA,
+    "table_op": _TABLE_OP_SCHEMA,
+    "image_op": _IMAGE_OP_SCHEMA,
+    "layout_op": _LAYOUT_OP_SCHEMA,
+    "list_op": _LIST_OP_SCHEMA,
+    "find_replace": _FIND_REPLACE_SCHEMA,
+    "theme_op": _THEME_OP_SCHEMA,
+    "slide_op": _SLIDE_OP_SCHEMA,
+    "ai_design_op": _AI_DESIGN_OP_SCHEMA,
+}
 
 
-def _build_structure_summary(structure: dict, document_type: str) -> str:
-    """Build a compact text summary of the document structure for the LLM."""
-    lines = []
-    
-    blocks = structure.get("blocks", [])
-    
-    def _format_colors(colors: list) -> str:
-        if not colors: return ""
-        named = [f"#{c} ({_guess_color_name(c)})" for c in colors]
-        return f" colors={named}"
+# ---------------------------------------------------------------------------
+# Legacy prompt (retained for backward compatibility of single-shot operations node)
+# ---------------------------------------------------------------------------
 
-    if document_type == "pptx":
-        lines.append(f"Document: PPTX with {len(blocks)} text block(s)")
-        for b in blocks:
-            meta = b.get("metadata", {})
-            role = meta.get("role", "none")
-            color_hint = _format_colors(meta.get("colors"))
-            lines.append(
-                f"  target_id='{b.get('element_id')}' "
-                f"role='{role}'{color_hint} "
-                f"text={b.get('text', '')[:80]!r}"
-            )
-    else:
-        # DOCX: emit elements in true document body order using the DOM
-        dom_children = (
-            structure.get("dom", {}).get("children", [])
-        )
+_SYSTEM_PROMPT = """You are a precise document editing operations generator.
+You convert document editing instructions into a list of structured operations.
 
-        if dom_children:
-            # DOM is already in body order after the fix
-            lines.append(f"Document: DOCX with {len(dom_children)} top-level block(s) in document order")
-            lines.append("NOTE: body_index shows the true sequential order of elements in the document.")
-            lines.append("Use body_index to reason about which section comes before/after another.")
-            lines.append("")
+Available Operation Types:
+1. text_edit: Rewrite text content of a targeted paragraph.
+   - target_id: paragraph element ID
+   - parameters: { new_text: str }
 
-            shown = 0
-            for el in dom_children:
-                if shown >= 150:
-                    lines.append(f"  ... and {len(dom_children) - shown} more elements (truncated)")
-                    break
+2. text_format: Apply formatting to a paragraph.
+   - target_id: paragraph element ID
+   - parameters: { bold: bool, italic: bool, underline: bool, strikethrough: bool, font_family: str, font_size_pt: float, color_hex: str, highlight_hex: str, alignment: 'left'|'center'|'right'|'justify', line_spacing: float, char_spacing: float }
 
-                el_type = el.get("type", "?")
-                el_id = el.get("id", "?")
-                body_idx = el.get("body_index", "?")
+3. table_op: Create, modify or style tables.
+   - target_id: table element ID (or null for insert) or list of IDs
+   - parameters: { action: 'create'|'delete'|'add_row'|'remove_row'|'add_col'|'remove_col'|'merge_cells'|'set_cell_bg'|'set_borders'|'alternate_rows'|'populate'|'sort_data'|'apply_theme'|'set_header_format', rows: int, cols: int, alternate_row_colors: list[str], data: list[list[str]], cell_bg_hex: str, border_color_hex: str, theme_color_hex: str, border_width_pt: float }
 
-                if el_type == "paragraph":
-                    role = el.get("role", "body")
-                    text = el.get("text", "")[:80]
-                    extra = ""
-                    if role == "heading":
-                        hlvl = el.get("heading_level", "")
-                        pbk = el.get("style", {}).get("page_break_before")
-                        pbk_str = f" page_break_before={pbk}" if pbk is not None else ""
-                        extra = f" heading_level={hlvl}{pbk_str}"
-                    elif role == "bullet_point":
-                        li = el.get("list_info", {})
-                        lt = li.get("list_type", "bullet")
-                        nid = li.get("num_id", "?")
-                        ilvl = li.get("ilvl", 0)
-                        extra = f" list_type={lt!r}  num_id={nid}  ilvl={ilvl}"
-                    lines.append(
-                        f"  body_index={body_idx}  target_id='{el_id}'  role='{role}'{extra}  text={text!r}"
-                    )
-                elif el_type == "table":
-                    rows = el.get("row_count", len(el.get("rows", [])))
-                    cols = el.get("col_count", 0)
-                    lines.append(
-                        f"  body_index={body_idx}  target_id='{el_id}'  role='table'  rows={rows} cols={cols}"
-                    )
-                elif el_type == "image":
-                    w_emu = el.get("width_emu", 0)
-                    h_emu = el.get("height_emu", 0)
-                    # Convert EMU to cm for human readability (1 cm = 360000 EMU)
-                    w_cm = round(w_emu / 360000, 1) if w_emu else "?"
-                    h_cm = round(h_emu / 360000, 1) if h_emu else "?"
-                    desc = el.get("description", "")
-                    align = el.get("alignment", "")
-                    desc_str = f"  description={desc!r}" if desc else ""
-                    lines.append(
-                        f"  body_index={body_idx}  target_id='{el_id}'  role='inline_image'"
-                        f"  size={w_cm}cm x {h_cm}cm  alignment={align!r}{desc_str}"
-                    )
-                else:
-                    lines.append(f"  body_index={body_idx}  target_id='{el_id}'  role='{el_type}'")
-                shown += 1
-        else:
-            # Fallback: use blocks list (old path)
-            lines.append(f"Document: DOCX with {len(blocks)} text block(s)")
-            for b in blocks[:150]:
-                meta = b.get("metadata", {})
-                role = meta.get("role", "none")
-                color_hint = _format_colors(meta.get("colors"))
-                lines.append(
-                    f"  target_id='{b.get('element_id')}' "
-                    f"role='{role}'{color_hint} "
-                    f"text={b.get('text', '')[:80]!r}"
-                )
-            if len(blocks) > 150:
-                lines.append(f"  ... and {len(blocks) - 150} more paragraphs")
-    
-    return "\n".join(lines)
+4. image_op: Insert or style images.
+   - target_id: image element ID (or null for insert) or list of IDs
+   - parameters: { action: 'insert'|'replace'|'remove'|'resize'|'reposition'|'rounded_corners'|'shadow', image_path: str, position: { left_pct: float, top_pct: float, width_pct: float, height_pct: float } }
+
+5. layout_op: Manipulate document pages / section order.
+   - target_id: null
+   - parameters: { action: 'move_block'|'insert_page_break'|'remove_block'|'duplicate_block'|'insert_block'|'insert_toc', start_id: str, end_id: str, before_id: str, after_id: str, data: list[dict] }
+
+6. list_op: List manipulations.
+   - target_id: null
+   - parameters: { action: 'convert_type'|'add_items'|'sort_items'|'set_bullet_char', start_id: str, end_id: str, anchor_id: str, list_type: 'bullet'|'numbered'|'checklist', items: list[str] }
+
+7. find_replace: Global search and replace.
+   - target_id: 'all'
+   - parameters: { find_text: str, replace_text: str, is_regex: bool }
+
+8. theme_op: Theme setting operations.
+   - target_id: null
+   - parameters: { action: 'set_bg_color'|'set_margins'|'add_page_numbers'|'apply_theme_colors', bg_color_hex: str, margin_inches: float }
+
+Return ONLY a JSON array of operations.
+"""
 
 
 class OperationGenerator:
-    """Converts a user request into a list of structured document operations."""
+    """Generates structured operations from editing tasks."""
+
+    def __init__(self, llm: LLMClient | None = None) -> None:
+        self._llm = llm
+
+    # ------------------------------------------------------------------
+    # Stage-focused generate_for_task (Phase 4)
+    # ------------------------------------------------------------------
+
+    def generate_for_task(
+        self,
+        task: dict,
+        resolved_ids: list[str],
+        element_context: dict[str, dict],
+        outline: dict,
+        attached_image_path: str | None = None,
+        previous_ops: list[dict] | None = None,
+        verifier_feedback: str | None = None,
+    ) -> list[dict]:
+        """Generate operations for a SINGLE task in the planner's sequence."""
+        task_type = task["task_type"]
+        schema = _SCHEMA_BY_TYPE.get(task_type)
+        if not schema:
+            log.warning("No operational schema found for task type: %s", task_type)
+            return []
+
+        # If it's an image insertion task but no image is attached, return needs_image
+        if task_type == "image_op" and not attached_image_path:
+            desc_lower = task["description"].lower()
+            if "insert" in desc_lower or "add" in desc_lower or "replace" in desc_lower:
+                return [needs_image_response(f"To satisfy: '{task['description']}', please upload an image.")]
+
+        llm = self._llm or LLMClient()
+
+        # Build task-specific context
+        import json
+        resolved_str = json.dumps(resolved_ids)
+        context_str = json.dumps(element_context, indent=2)
+        outline_summary = json.dumps({
+            "document_type": outline.get("document_type"),
+            "title": outline.get("title"),
+            "indices": outline.get("indices"),
+        }, indent=2)
+
+        repair_str = ""
+        if verifier_feedback and previous_ops:
+            repair_str = (
+                f"\n=== REPAIR FEEDBACK ===\n"
+                f"Your previous operations for this task: {json.dumps(previous_ops)}\n"
+                f"Verifier Feedback: {verifier_feedback}\n"
+                f"Please fix the operations to satisfy this feedback.\n"
+            )
+
+        system_prompt = (
+            f"You are a document operations generator specializing in '{task_type}' changes.\n"
+            f"Given a target task, the target element IDs, the content of those elements, "
+            f"and the document outline, generate the structured operations required to perform the change.\n\n"
+            f"FORMAT SCHEMA FOR '{task_type}':\n{schema}\n"
+            "RULES:\n"
+            "1. Output ONLY the raw JSON array. Do not include markdown wraps (like ```json) or commentary.\n"
+            "2. Use the resolved target IDs exactly as provided. Do NOT invent IDs.\n"
+            "3. Make sure all parameters strictly match the schema fields.\n"
+            "4. If you receive Repair Feedback, you MUST alter your previous operations to address the error. If the verifier repeatedly complains that a style (like paragraph spacing) was not applied, it may be unsupported by the extraction engine—in that case, do not emit the exact same JSON again; skip it or try an alternative.\n"
+            "5. CRITICAL FOR list_op and layout_op: 'target_id' MUST be null! Place the provided Target Element IDs into 'start_id' and 'end_id' instead."
+        )
+
+        user_prompt = (
+            f"Task: {task['description']}\n"
+            f"Target Element ID(s): {resolved_str}\n"
+            f"Element Context: {context_str}\n"
+            f"Outline: {outline_summary}\n"
+            f"Attached Image: {attached_image_path or 'None'}\n"
+            f"{repair_str}"
+        )
+
+        response = llm.complete(LLMRequest(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            temperature=0.0,
+            max_tokens=2048,
+            json_mode=True,
+        ))
+
+        parsed = response.json
+        ops_raw = []
+        if isinstance(parsed, list):
+            ops_raw = parsed
+        elif isinstance(parsed, dict):
+            ops_raw = parsed.get("operations") or parsed.get("ops") or [parsed]
+
+        # Populate image_path if needed
+        for op in ops_raw:
+            if isinstance(op, dict) and op.get("op_type") == "image_op" and attached_image_path:
+                op.setdefault("parameters", {})
+                if not op["parameters"].get("image_path"):
+                    op["parameters"]["image_path"] = attached_image_path
+
+        # Validate
+        validated = []
+        for op in ops_raw:
+            try:
+                validated.append(validate_operation(op))
+            except ValueError as e:
+                log.warning("Task op validation failed: %s — %s", op, e)
+
+        return validated
+
+    # ------------------------------------------------------------------
+    # Legacy generate (retained for backward compatibility)
+    # ------------------------------------------------------------------
 
     def generate(
         self,
@@ -543,12 +385,8 @@ class OperationGenerator:
         reviewer_feedback: str | None = None,
         missed_tasks: list[str] | None = None,
     ) -> list[dict]:
-        """Generate operations for the given request.
-        
-        Returns a list of validated operation dicts.
-        Falls back to a helpful error operation if LLM is unavailable.
-        """
-        if settings.openai_api_key:
+        """Legacy single-shot operation generator."""
+        if settings.gemini_api_key or settings.openai_api_key:
             try:
                 return self._generate_with_llm(
                     request, structure, document_type, chat_history,
@@ -556,13 +394,9 @@ class OperationGenerator:
                     missed_tasks,
                 )
             except Exception as exc:
-                log.exception("LLM operation generation failed: %s", exc)
+                log.exception("LLM legacy operations generation failed: %s", exc)
         
         return self._generate_fallback(request, intent, attached_image_path)
-
-    # ------------------------------------------------------------------
-    # LLM path
-    # ------------------------------------------------------------------
 
     def _generate_with_llm(
         self,
@@ -576,21 +410,12 @@ class OperationGenerator:
         reviewer_feedback: str | None,
         missed_tasks: list[str] | None = None,
     ) -> list[dict]:
-        from openai import OpenAI
-        from datetime import datetime
+        llm = self._llm or LLMClient()
         sys_prompt = _SYSTEM_PROMPT.replace("{CURRENT_DATE}", datetime.now().strftime("%B %d, %Y"))
-
-        client = OpenAI(
-            api_key=settings.openai_api_key,
-            base_url=settings.openai_base_url or None,
-        )
-
-        messages = [{"role": "system", "content": sys_prompt}]
         
-        # Add summary of what we found in structure
-        structure_summary = _build_structure_summary(structure, document_type)
+        outline = OutlineBuilder.build(structure, document_type)
+        structure_summary = json.dumps(outline, indent=2)
         
-        # Build history context
         history_str = ""
         if chat_history:
             history_str = "Recent conversation:\n"
@@ -599,155 +424,55 @@ class OperationGenerator:
                 history_str += f"{role}: {msg['content'][:200]}\n"
             history_str += "\n"
 
-        # Image context
         image_str = ""
         if attached_image_path:
-            image_str = f"Attached image path (use this for image_op): {attached_image_path}\n"
-        else:
-            image_str = "No image attached.\n"
+            image_str = f"Attached image path: {attached_image_path}\n"
 
-        # Previous ops + feedback (for refinement rounds)
         refinement_str = ""
         if reviewer_feedback and previous_ops:
             missed_str = ""
             if missed_tasks:
-                missed_str = (
-                    f"\nSub-tasks still MISSING (must be included in your new list):\n"
-                    + "\n".join(f"  - {t}" for t in missed_tasks)
-                    + "\n"
-                )
-            refinement_str = (
-                f"\nPrevious attempt (context only — do NOT copy these verbatim):\n{json.dumps(previous_ops, indent=2)}\n"
-                f"Reviewer feedback: {reviewer_feedback}\n"
-                f"{missed_str}"
-                "IMPORTANT: Regenerate the COMPLETE operation list from scratch, fixing the issues above.\n"
-                "Your new list replaces the previous one entirely — include ALL operations needed,\n"
-                "both the ones that were correct AND the fixed/new ones for the missing sub-tasks.\n"
-                "Do NOT emit a partial list.\n"
-            )
-
-        # Build op_categories hint
-        op_categories = intent.get("op_categories", [])
-        if not op_categories:
-            primary = intent.get("op_category", "")
-            op_categories = [primary] if primary else []
-        categories_str = ""
-        if op_categories:
-            categories_str = (
-                f"Operation categories needed for this request: {', '.join(op_categories)}\n"
-                "You MUST produce operations covering ALL of the above categories.\n"
-            )
-
-        # Build a brief document summary for generative requests
-        # (helps the LLM correctly place new sections and write descriptive placeholder text)
-        doc_summary_str = ""
-        if document_type == "docx":
-            dom_children = structure.get("dom", {}).get("children", [])
-            heading_titles = [
-                el.get("text", "").strip()
-                for el in dom_children
-                if el.get("type") == "paragraph" and el.get("role") == "heading"
-                and el.get("text", "").strip()
-            ]
-            body_excerpts = [
-                el.get("text", "").strip()[:200]
-                for el in dom_children
-                if el.get("type") == "paragraph" and el.get("role") == "body"
-                and el.get("text", "").strip()
-            ][:3]
-            if heading_titles or body_excerpts:
-                doc_summary_str = "Document summary for context:\n"
-                if heading_titles:
-                    doc_summary_str += f"  Sections: {', '.join(heading_titles[:12])}\n"
-                if body_excerpts:
-                    doc_summary_str += f"  Content excerpt: {' '.join(body_excerpts)[:400]}\n"
-                doc_summary_str += "\n"
+                missed_str = f"\nMissing tasks: {missed_tasks}\n"
+            refinement_str = f"\nPrevious attempt: {json.dumps(previous_ops)}\nFeedback: {reviewer_feedback}\n{missed_str}"
 
         user_prompt = (
             f"{history_str}"
             f"{image_str}"
-            f"{categories_str}"
-            f"{doc_summary_str}"
-            f"Document structure:\n{structure_summary}\n\n"
+            f"Document outline:\n{structure_summary}\n\n"
             f"{refinement_str}"
-            f"User instruction: {request}\n\n"
-            "IMPORTANT: Before closing the JSON array, verify that every sub-task in the user "
-            "instruction has at least one operation covering it. Add any missing operations now.\n"
-            "Return a JSON array of operation objects."
+            f"User instruction: {request}"
         )
 
-        response = client.chat.completions.create(
-            model=settings.llm_model,
-            messages=[
-                {"role": "system", "content": sys_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            temperature=0.3,
-            max_tokens=8192,
-            response_format={"type": "json_object"},
-        )
+        import logging
+        log = logging.getLogger(__name__)
 
-        raw = (response.choices[0].message.content or "{}").strip()
-        
-        # Rescue truncated JSON arrays if max_tokens was hit
-        if not raw.endswith("]") and not raw.endswith("}"):
-            last_brace = raw.rfind("}")
-            if last_brace != -1:
-                # If it started with an object wrapper, close both the array and object
-                if raw.startswith("{"):
-                    raw = raw[:last_brace+1] + "\n]\n}"
-                else:
-                    raw = raw[:last_brace+1] + "\n]"
-                
-        # The model returns a JSON object — we accept either {"operations": [...]} or [...]
-        try:
-            parsed = json.loads(raw)
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-            print("RAW OUTPUT WAS:", raw)
-            raise e
-            
+        response = llm.complete(LLMRequest(
+            system_prompt=sys_prompt,
+            user_prompt=user_prompt,
+            temperature=0,
+            max_tokens=4096,
+            json_mode=True,
+        ))
+
+        log.warning(f"OPERATION GENERATOR RAW RESPONSE: {response.text}")
+        print(f"OPERATION GENERATOR RAW RESPONSE: {response.text}")
+
+        parsed = response.json or {}
         if isinstance(parsed, list):
             ops_raw = parsed
         elif isinstance(parsed, dict):
-            # Try common wrapper keys
-            ops_raw = (
-                parsed.get("operations")
-                or parsed.get("ops")
-                or parsed.get("result")
-                or [parsed]
-            )
+            ops_raw = parsed.get("operations") or parsed.get("ops") or [parsed]
         else:
             ops_raw = []
-            
-        # Deduplicate identical operations
-        unique_ops = []
-        seen_ops = set()
-        for op in ops_raw:
-            if isinstance(op, dict):
-                import json as _json
-                op_str = _json.dumps(op, sort_keys=True)
-                if op_str not in seen_ops:
-                    seen_ops.add(op_str)
-                    unique_ops.append(op)
 
-        # Validate each operation
         validated = []
-        for op in unique_ops:
+        for op in ops_raw:
             try:
                 validated.append(validate_operation(op))
-            except ValueError as e:
-                log.warning("Skipping invalid operation: %s — %s", op, e)
+            except Exception as e:
+                log.warning("Legacy op validation failed: %s", e)
 
-        if not validated:
-            log.warning("LLM returned no valid operations for request: %r", request)
-        
         return validated
-
-    # ------------------------------------------------------------------
-    # Fallback (no LLM)
-    # ------------------------------------------------------------------
 
     def _generate_fallback(
         self,
@@ -755,11 +480,7 @@ class OperationGenerator:
         intent: dict,
         attached_image_path: str | None,
     ) -> list[dict]:
-        """Minimal heuristic fallback when the LLM is unavailable."""
         category = intent.get("op_category", "")
-        
-        # Only fallback insert/replace to needs_image if explicitly falling back
-        # Note: the LLM is smart enough to generate needs_image natively when needed.
         if category == "image_op" and attached_image_path:
             slide = intent.get("slide", 1) or 1
             return [validate_operation({
@@ -788,7 +509,6 @@ class OperationGenerator:
                     "parameters": {"action": "delete"},
                 })]
 
-        # Generic AI design fallback
         return [validate_operation({
             "op_type": "ai_design_op",
             "target": {},

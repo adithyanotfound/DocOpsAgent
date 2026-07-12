@@ -1,7 +1,10 @@
 import re
 import uuid
+import logging
 
 from app.core.config import settings
+
+log = logging.getLogger(__name__)
 
 STOPWORDS = {
     "a", "all", "and", "are", "for", "find", "in",
@@ -15,34 +18,52 @@ COLLECTION_NAME = "document_blocks"
 class RetrievalService:
     """Retrieves relevant document blocks for a given query.
 
-    Uses Qdrant vector search when both ``qdrant_url`` and ``openai_api_key``
-    are configured.  Falls back to the local lexical scorer otherwise.
+    Uses Qdrant vector search when configured, otherwise falls back to
+    local lexical scoring. Supports both OpenAI embeddings and Gemini embeddings
+    via the GeminiEmbeddingClient.
     """
+
+    def __init__(self, embed_client=None) -> None:
+        self._embed_client = embed_client
+
+    def _get_embedding_client(self):
+        if self._embed_client:
+            return self._embed_client
+        
+        if settings.llm_provider == "gemini":
+            from app.services.embedding_client import GeminiEmbeddingClient
+            return GeminiEmbeddingClient()
+        else:
+            # Fallback to legacy OpenAI embedding method using the legacy EmbeddingClient from llm_client
+            from app.services.llm_client import EmbeddingClient
+            return EmbeddingClient()
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
     def retrieve(self, query: str, structure: dict, limit: int = 4) -> list[dict]:
-        if settings.qdrant_url and settings.openai_api_key:
+        if settings.qdrant_url and (settings.gemini_api_key or settings.openai_api_key):
             try:
                 return self._retrieve_semantic(query, structure, limit)
-            except Exception:
+            except Exception as exc:
+                log.warning("Semantic retrieval failed: %s. Falling back to local.", exc)
                 pass
         return self._retrieve_local(query, structure, limit)
 
     def index_workspace(self, workspace_id: str, structure: dict) -> None:
         """Upsert all document blocks for a workspace into Qdrant."""
-        if not (settings.qdrant_url and settings.openai_api_key):
+        if not (settings.qdrant_url and (settings.gemini_api_key or settings.openai_api_key)):
             return
         try:
             self._upsert_blocks(workspace_id, structure)
-        except Exception:
+        except Exception as exc:
+            log.warning("Workspace indexing failed: %s", exc)
             pass
 
     def delete_workspace(self, workspace_id: str) -> None:
         """Delete all document blocks for a workspace from Qdrant."""
-        if not (settings.qdrant_url and settings.openai_api_key):
+        if not (settings.qdrant_url and (settings.gemini_api_key or settings.openai_api_key)):
             return
         try:
             from qdrant_client.models import Filter, FieldCondition, MatchValue
@@ -58,11 +79,12 @@ class RetrievalService:
                     ],
                 ),
             )
-        except Exception:
+        except Exception as exc:
+            log.warning("Workspace deletion failed: %s", exc)
             pass
 
     # ------------------------------------------------------------------
-    # Qdrant / embedding path
+    # Qdrant path
     # ------------------------------------------------------------------
 
     def _get_qdrant_client(self):
@@ -73,30 +95,19 @@ class RetrievalService:
             api_key=settings.qdrant_api_key or None,
         )
 
-    def _get_openai_client(self):
-        from openai import OpenAI
-
-        return OpenAI(
-            api_key=settings.openai_api_key,
-            base_url=settings.openai_base_url or None,
-        )
-
-    def _embed(self, texts: list[str]) -> list[list[float]]:
-        client = self._get_openai_client()
-        response = client.embeddings.create(
-            model=settings.embedding_model,
-            input=texts,
-        )
-        return [item.embedding for item in response.data]
-
     def _ensure_collection(self, qdrant, vector_size: int) -> None:
-        from qdrant_client.models import Distance, VectorParams
+        from qdrant_client.models import Distance, VectorParams, PayloadSchemaType
 
         existing = {col.name for col in qdrant.get_collections().collections}
         if COLLECTION_NAME not in existing:
             qdrant.create_collection(
                 collection_name=COLLECTION_NAME,
                 vectors_config=VectorParams(size=vector_size, distance=Distance.COSINE),
+            )
+            qdrant.create_payload_index(
+                collection_name=COLLECTION_NAME,
+                field_name="workspace_id",
+                field_schema=PayloadSchemaType.KEYWORD,
             )
 
     def _upsert_blocks(self, workspace_id: str, structure: dict) -> None:
@@ -107,7 +118,13 @@ class RetrievalService:
             return
 
         texts = [block["text"] for block in blocks]
-        embeddings = self._embed(texts)
+        
+        embedder = self._get_embedding_client()
+        # Use appropriate method name depending on type
+        if hasattr(embedder, "embed_documents"):
+            embeddings = embedder.embed_documents(texts)
+        else:
+            embeddings = embedder.embed(texts)
 
         qdrant = self._get_qdrant_client()
         self._ensure_collection(qdrant, len(embeddings[0]))
@@ -136,11 +153,14 @@ class RetrievalService:
         if not blocks_by_id:
             return []
 
-        query_vector = self._embed([query])[0]
+        embedder = self._get_embedding_client()
+        if hasattr(embedder, "embed_query"):
+            query_vector = embedder.embed_query(query)
+        else:
+            query_vector = embedder.embed([query])[0]
+
         qdrant = self._get_qdrant_client()
 
-        # We don't filter by workspace here since structure already scopes blocks.
-        # We pass block texts as the lookup and match on element_id.
         results = qdrant.search(
             collection_name=COLLECTION_NAME,
             query_vector=query_vector,
@@ -148,7 +168,6 @@ class RetrievalService:
             score_threshold=0.45,
         )
 
-        # Return blocks from the current structure that match retrieved element_ids.
         found: list[dict] = []
         for hit in results:
             eid = hit.payload.get("element_id") if hit.payload else None

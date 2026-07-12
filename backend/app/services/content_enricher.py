@@ -9,6 +9,8 @@ Two responsibilities:
    2-column tables (Section | Page) built from the document's actual heading structure,
    so the ToC renders correctly in the PDF preview (Word's native TOC field requires
    a field update, which never happens during server-side conversion).
+
+Uses LLMClient for provider-agnostic LLM calls (Gemini by default).
 """
 from __future__ import annotations
 
@@ -46,7 +48,6 @@ def _block_needs_enrichment(op: dict) -> bool:
     data = params.get("data", [])
     if not data:
         return True
-    # Thin: only heading with no body, or all body items are placeholders
     body_items = [d for d in data if d.get("role") != "heading"]
     if not body_items:
         return True
@@ -65,7 +66,7 @@ def _extract_document_context(structure: dict) -> dict:
     """Pull a concise context object from the document structure."""
     dom_children = structure.get("dom", {}).get("children", [])
 
-    headings: list[dict] = []   # {text, level}
+    headings: list[dict] = []
     body_samples: list[str] = []
 
     for el in dom_children:
@@ -145,14 +146,10 @@ def _enrich_sections_with_llm(
     ops_needing_enrichment: list[tuple[int, dict]],
     doc_summary: str,
     original_request: str,
-    api_key: str,
-    base_url: str | None,
-    llm_model: str,
+    llm,
 ) -> dict[int, list[dict]]:
     """Call LLM once to generate content for all insert_block ops that need it."""
-    from openai import OpenAI
-
-    client = OpenAI(api_key=api_key, base_url=base_url or None)
+    from app.services.llm_client import LLMRequest
 
     sections = []
     for idx, op in ops_needing_enrichment:
@@ -161,56 +158,47 @@ def _enrich_sections_with_llm(
         section_title = headings_in_op[0] if headings_in_op else "New Section"
         sections.append({"index": idx, "title": section_title})
 
-    system_prompt = (
-        "You are a professional document writer. Given a document's context and a list of new sections "
-        "that need to be added, generate substantive, professional content for each section.\n\n"
-        "RULES:\n"
-        "1. For each section, produce 2-3 paragraphs of real, relevant content based on the document context.\n"
-        "2. Content must be specific to the document's domain — NOT generic filler or placeholders.\n"
-        "3. Each paragraph should be 2-5 sentences.\n"
-        "4. For a 'Conclusion' section: summarize the key points from the document and suggest next steps.\n"
-        "5. For a 'Risks and Challenges' section: identify specific risks relevant to the document's domain.\n"
-        "6. For any other section: write content appropriate to the section title and document context.\n"
-        "7. Return ONLY a valid JSON object:\n"
-        "   {\n"
-        "     \"sections\": [\n"
-        "       {\n"
-        "         \"index\": <number>,\n"
-        "         \"title\": \"<section title>\",\n"
-        "         \"data\": [\n"
-        "           {\"role\": \"heading\", \"text\": \"<title>\", \"heading_level\": 2},\n"
-        "           {\"role\": \"body\", \"text\": \"<paragraph 1>\"},\n"
-        "           {\"role\": \"body\", \"text\": \"<paragraph 2>\"},\n"
-        "           {\"role\": \"body\", \"text\": \"<paragraph 3>\"}\n"
-        "         ]\n"
-        "       }\n"
-        "     ]\n"
-        "   }\n"
-        "8. Do NOT include markdown fences, commentary, or any text outside the JSON object."
-    )
-
-    user_prompt = (
-        f"Document context:\n{doc_summary}\n\n"
-        f"User's original request: {original_request}\n\n"
-        f"Sections needing content:\n{json.dumps(sections, indent=2)}\n\n"
-        f"Current date: {datetime.now().strftime('%B %d, %Y')}\n\n"
-        "Generate professional, relevant content for each section above."
-    )
-
-    response = client.chat.completions.create(
-        model=llm_model,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
+    response = llm.complete(LLMRequest(
+        system_prompt=(
+            "You are a professional document writer. Given a document's context and a list of new sections "
+            "that need to be added, generate substantive, professional content for each section.\n\n"
+            "RULES:\n"
+            "1. For each section, produce 2-3 paragraphs of real, relevant content based on the document context.\n"
+            "2. Content must be specific to the document's domain — NOT generic filler or placeholders.\n"
+            "3. Each paragraph should be 2-5 sentences.\n"
+            "4. For a 'Conclusion' section: summarize the key points from the document and suggest next steps.\n"
+            "5. For a 'Risks and Challenges' section: identify specific risks relevant to the document's domain.\n"
+            "6. For any other section: write content appropriate to the section title and document context.\n"
+            "7. Return ONLY a valid JSON object:\n"
+            "   {\n"
+            '     "sections": [\n'
+            "       {\n"
+            '         "index": <number>,\n'
+            '         "title": "<section title>",\n'
+            '         "data": [\n'
+            '           {"role": "heading", "text": "<title>", "heading_level": 2},\n'
+            '           {"role": "body", "text": "<paragraph 1>"},\n'
+            '           {"role": "body", "text": "<paragraph 2>"},\n'
+            '           {"role": "body", "text": "<paragraph 3>"}\n'
+            "         ]\n"
+            "       }\n"
+            "     ]\n"
+            "   }\n"
+            "8. Do NOT include markdown fences, commentary, or any text outside the JSON object."
+        ),
+        user_prompt=(
+            f"Document context:\n{doc_summary}\n\n"
+            f"User's original request: {original_request}\n\n"
+            f"Sections needing content:\n{json.dumps(sections, indent=2)}\n\n"
+            f"Current date: {datetime.now().strftime('%B %d, %Y')}\n\n"
+            "Generate professional, relevant content for each section above."
+        ),
         temperature=0.4,
         max_tokens=4096,
-        response_format={"type": "json_object"},
-    )
+        json_mode=True,
+    ))
 
-    raw = (response.choices[0].message.content or "{}").strip()
-    parsed = json.loads(raw)
-
+    parsed = response.json or {}
     result: dict[int, list[dict]] = {}
     for section in parsed.get("sections", []):
         idx = section.get("index")
@@ -226,12 +214,14 @@ def _enrich_sections_with_llm(
 # ---------------------------------------------------------------------------
 
 class ContentEnricher:
-    """Post-processes operations to fill in substantive content and fix ToC."""
+    """Post-processes operations to fill in substantive content and fix ToC.
 
-    def __init__(self, api_key: str, base_url: str | None, llm_model: str) -> None:
-        self._api_key = api_key
-        self._base_url = base_url
-        self._llm_model = llm_model
+    Constructor no longer takes api_key/base_url/llm_model directly.
+    Pass a pre-built LLMClient instance (or leave None to have one built lazily).
+    """
+
+    def __init__(self, llm=None) -> None:
+        self._llm = llm
 
     def enrich(
         self,
@@ -276,14 +266,15 @@ class ContentEnricher:
             len(ops_needing),
         )
 
+        from app.services.llm_client import LLMClient
+        llm = self._llm or LLMClient()
+
         try:
             enriched_data_map = _enrich_sections_with_llm(
                 ops_needing_enrichment=ops_needing,
                 doc_summary=doc_summary,
                 original_request=original_request,
-                api_key=self._api_key,
-                base_url=self._base_url,
-                llm_model=self._llm_model,
+                llm=llm,
             )
             for idx, new_data in enriched_data_map.items():
                 if new_data:

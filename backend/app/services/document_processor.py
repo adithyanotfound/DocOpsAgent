@@ -720,17 +720,28 @@ class DocumentProcessor:
             tgt["slide"] = int(m.group(1))
         if m := re.search(r'shape_(\d+)', target_id):
             tgt["shape_index"] = int(m.group(1))
-        # image_N must be checked before paragraph_N to avoid partial match on 'paragraph_N'
+        
+        # New: Sections, Headers, Footers
+        if m := re.search(r'section_(\d+)', target_id):
+            tgt["section_index"] = int(m.group(1))
+        if m := re.search(r'header_(\d+)', target_id):
+            tgt["header_index"] = int(m.group(1))
+        if m := re.search(r'footer_(\d+)', target_id):
+            tgt["footer_index"] = int(m.group(1))
+            
+        # image_N must be checked before paragraph_N to avoid partial match
         if re.match(r'^image_\d+$', target_id):
             m = re.search(r'image_(\d+)', target_id)
             if m:
-                tgt["image_index"] = int(m.group(1))
+                tgt["image_index"] = int(m.group(1)) - 1
         elif m := re.search(r'paragraph_(\d+)', target_id):
-            tgt["paragraph_index"] = int(m.group(1))
+            tgt["paragraph_index"] = int(m.group(1)) - 1
+        elif m := re.search(r'table_(\d+)', target_id):
+            tgt["table_index"] = int(m.group(1)) - 1
+        
         if m := re.search(r'_para_(\d+)', target_id):
             tgt["para_index"] = int(m.group(1))
-        if m := re.search(r'table_(\d+)', target_id):
-            tgt["table_index"] = int(m.group(1))
+        # Note: cell_ and _run_ handlers remain below
         if m := re.search(r'cell_(\d+)_(\d+)', target_id):
             tgt["row_index"] = int(m.group(1))
             tgt["col_index"] = int(m.group(2))
@@ -752,86 +763,94 @@ class DocumentProcessor:
         summaries: list[str] = []
         changed = False
 
-        for op in operations:
-            op_type = op.get("op_type", "")
-            params = op.get("parameters", {})
-            tgt = self._parse_target_id(op.get("target_id") or "")
+        for raw_op in operations:
+            target_ids = raw_op.get("target_id")
+            if not isinstance(target_ids, list):
+                target_ids = [target_ids]
+            
+            for t_id in target_ids:
+                op = dict(raw_op)
+                op["target_id"] = t_id
+                
+                op_type = op.get("op_type", "")
+                params = op.get("parameters", {})
+                tgt = self._parse_target_id(op.get("target_id") or "")
 
 
-            try:
-                if op_type == "text_edit":
-                    s = self._op_pptx_text_edit(prs, tgt, params)
-                    if s:
-                        summaries.append(s); changed = True
+                try:
+                    if op_type == "text_edit":
+                        s = self._op_pptx_text_edit(prs, tgt, params)
+                        if s:
+                            summaries.append(s); changed = True
 
-                elif op_type == "text_format":
-                    if op.get("target_id") == "all":
-                        match_color = params.get("match_color_hex")
-                        match_role = params.get("match_role")
-                        if match_color or match_role:
-                            for slide in prs.slides:
-                                for shape in slide.shapes:
-                                    if getattr(shape, "has_text_frame", False):
-                                        for para in shape.text_frame.paragraphs:
-                                            self._apply_pptx_format_to_para(para, {}, params, shape)
-                                    if getattr(shape, "has_table", False):
-                                        for row in shape.table.rows:
-                                            for cell in row.cells:
-                                                if getattr(cell, "text_frame", None):
-                                                    for para in cell.text_frame.paragraphs:
-                                                        self._apply_pptx_format_to_para(para, {}, params, shape)
-                            summaries.append(f"Formatted all paragraphs matching criteria")
-                            changed = True
-                        continue
+                    elif op_type == "text_format":
+                        if op.get("target_id") == "all":
+                            match_color = params.get("match_color_hex")
+                            match_role = params.get("match_role")
+                            if match_color or match_role:
+                                for slide in prs.slides:
+                                    for shape in slide.shapes:
+                                        if getattr(shape, "has_text_frame", False):
+                                            for para in shape.text_frame.paragraphs:
+                                                self._apply_pptx_format_to_para(para, {}, params, shape)
+                                        if getattr(shape, "has_table", False):
+                                            for row in shape.table.rows:
+                                                for cell in row.cells:
+                                                    if getattr(cell, "text_frame", None):
+                                                        for para in cell.text_frame.paragraphs:
+                                                            self._apply_pptx_format_to_para(para, {}, params, shape)
+                                summaries.append(f"Formatted all paragraphs matching criteria")
+                                changed = True
+                            continue
 
-                    s = self._op_pptx_text_format(prs, tgt, params)
-                    if s:
-                        summaries.append(s); changed = True
+                        s = self._op_pptx_text_format(prs, tgt, params)
+                        if s:
+                            summaries.append(s); changed = True
 
-                elif op_type == "table_op":
-                    s = self._op_pptx_table(prs, tgt, params)
-                    if s:
-                        summaries.append(s); changed = True
+                    elif op_type == "table_op":
+                        s = self._op_pptx_table(prs, tgt, params)
+                        if s:
+                            summaries.append(s); changed = True
 
-                elif op_type == "image_op":
-                    s = self._op_pptx_image(prs, tgt, params)
-                    if s:
-                        summaries.append(s); changed = True
+                    elif op_type == "image_op":
+                        s = self._op_pptx_image(prs, tgt, params)
+                        if s:
+                            summaries.append(s); changed = True
 
-                elif op_type == "shape_op":
-                    s = self._op_pptx_shape(prs, tgt, params)
-                    if s:
-                        summaries.append(s); changed = True
+                    elif op_type == "shape_op":
+                        s = self._op_pptx_shape(prs, tgt, params)
+                        if s:
+                            summaries.append(s); changed = True
 
-                elif op_type == "theme_op":
-                    s = self._op_pptx_theme(prs, tgt, params)
-                    if s:
-                        summaries.append(s); changed = True
+                    elif op_type == "theme_op":
+                        s = self._op_pptx_theme(prs, tgt, params)
+                        if s:
+                            summaries.append(s); changed = True
 
-                elif op_type == "slide_op":
-                    s = self._op_pptx_slide(prs, tgt, params)
-                    if s:
-                        summaries.append(s); changed = True
+                    elif op_type == "slide_op":
+                        s = self._op_pptx_slide(prs, tgt, params)
+                        if s:
+                            summaries.append(s); changed = True
 
-                elif op_type == "chart_op":
-                    s = self._op_pptx_chart(prs, tgt, params)
-                    if s:
-                        summaries.append(s); changed = True
+                    elif op_type == "chart_op":
+                        s = self._op_pptx_chart(prs, tgt, params)
+                        if s:
+                            summaries.append(s); changed = True
 
-                elif op_type == "ai_design_op":
-                    s = self._op_pptx_ai_design(prs, tgt, params)
-                    if s:
-                        summaries.append(s); changed = True
+                    elif op_type == "ai_design_op":
+                        s = self._op_pptx_ai_design(prs, tgt, params)
+                        if s:
+                            summaries.append(s); changed = True
 
-                elif op_type == "needs_image":
-                    # Handled upstream — shouldn't reach here
-                    pass
+                    elif op_type == "needs_image":
+                        # Handled upstream — shouldn't reach here
+                        pass
 
-                else:
-                    log.warning("Unknown op_type in operations list: %r", op_type)
+                    else:
+                        log.warning("Unknown op_type in operations list: %r", op_type)
 
-            except Exception as exc:
-                log.exception("Failed to apply operation %r: %s", op_type, exc)
+                except Exception as exc:
+                    log.exception("Failed to apply operation %r: %s", op_type, exc)
 
         if changed:
             prs.save(target)
@@ -841,6 +860,27 @@ class DocumentProcessor:
             shutil.copy2(source, target)
 
         return changed, summaries
+
+    def _resolve_target_paras(self, doc: Document, tgt: dict) -> list:
+        """Resolves the target ID dictionary to a list of paragraph elements."""
+        if "table_index" in tgt and "row_index" in tgt and "col_index" in tgt:
+            try:
+                table = doc.tables[tgt["table_index"]]
+                cell = table.cell(tgt["row_index"], tgt["col_index"])
+                return cell.paragraphs
+            except Exception:
+                pass
+        if "header_index" in tgt and "section_index" in tgt:
+            try:
+                return doc.sections[tgt["section_index"]].header.paragraphs
+            except Exception:
+                pass
+        if "footer_index" in tgt and "section_index" in tgt:
+            try:
+                return doc.sections[tgt["section_index"]].footer.paragraphs
+            except Exception:
+                pass
+        return doc.paragraphs
 
     def _apply_docx_operations(
         self,
@@ -853,33 +893,35 @@ class DocumentProcessor:
         summaries: list[str] = []
         changed = False
 
-        for op in operations:
-            op_type = op.get("op_type", "")
-            params = op.get("parameters", {})
-            tgt = self._parse_target_id(op.get("target_id") or "")
+        for raw_op in operations:
+            target_ids = raw_op.get("target_id")
+            if not isinstance(target_ids, list):
+                target_ids = [target_ids]
+            
+            for t_id in target_ids:
+                op = dict(raw_op)
+                op["target_id"] = t_id
+                
+                op_type = op.get("op_type", "")
+                params = op.get("parameters", {})
+                tgt = self._parse_target_id(op.get("target_id") or "")
 
-            try:
-                if op_type == "text_edit":
-                    para_idx = tgt.get("paragraph_index", tgt.get("para_index"))
-                    new_text = params.get("new_text", "")
-                    if para_idx is not None and new_text:
-                        if "table_index" in tgt and "row_index" in tgt and "col_index" in tgt:
-                            table = doc.tables[tgt["table_index"]]
-                            cell = table.cell(tgt["row_index"], tgt["col_index"])
-                            paras = cell.paragraphs
-                        else:
-                            paras = doc.paragraphs
+                try:
+                    if op_type == "text_edit":
+                        para_idx = tgt.get("paragraph_index", tgt.get("para_index"))
+                        new_text = params.get("new_text", "")
+                        if para_idx is not None and new_text:
+                            paras = self._resolve_target_paras(doc, tgt)
 
-                        if 0 <= para_idx < len(paras):
-                            self._apply_run_aware_replacement(paras[para_idx], new_text, params)
-                            summaries.append(f"Rewrote paragraph {para_idx}")
-                            changed = True
+                            if paras and 0 <= para_idx < len(paras):
+                                self._apply_run_aware_replacement(paras[para_idx], new_text, params)
+                                summaries.append(f"Rewrote paragraph {para_idx}")
+                                changed = True
 
-                elif op_type == "text_format":
-                    if op.get("target_id") == "all":
-                        match_color = params.get("match_color_hex")
-                        match_role = params.get("match_role")
-                        if match_color or match_role:
+                    elif op_type == "text_format":
+                        if op.get("target_id") == "all":
+                            match_color = params.get("match_color_hex")
+                            match_role = params.get("match_role")
                             for p in doc.paragraphs:
                                 self._apply_docx_format(p, {}, params)
                             for tbl in doc.tables:
@@ -887,75 +929,103 @@ class DocumentProcessor:
                                     for cell in row.cells:
                                         for p in cell.paragraphs:
                                             self._apply_docx_format(p, {}, params)
-                            summaries.append(f"Formatted all paragraphs matching criteria")
+                            summaries.append(f"Formatted all paragraphs")
                             changed = True
-                        continue
+                            continue
 
-                    para_idx = tgt.get("paragraph_index", tgt.get("para_index"))
-                    if para_idx is not None:
-                        if "table_index" in tgt and "row_index" in tgt and "col_index" in tgt:
-                            table = doc.tables[tgt["table_index"]]
-                            cell = table.cell(tgt["row_index"], tgt["col_index"])
-                            paras = cell.paragraphs
-                        else:
-                            paras = doc.paragraphs
+                        para_idx = tgt.get("paragraph_index", tgt.get("para_index"))
+                        if para_idx is not None:
+                            paras = self._resolve_target_paras(doc, tgt)
 
-                        if 0 <= para_idx < len(paras):
-                            self._apply_docx_format(paras[para_idx], tgt, params)
-                            summaries.append(f"Formatted paragraph {para_idx}")
+                            if paras and 0 <= para_idx < len(paras):
+                                self._apply_docx_format(paras[para_idx], tgt, params)
+                                summaries.append(f"Formatted paragraph {para_idx}")
+                                changed = True
+                        elif "table_index" in tgt:
+                            table_idx = tgt.get("table_index")
+                            if table_idx is not None and 0 <= table_idx < len(doc.tables):
+                                table = doc.tables[table_idx]
+                                for row in table.rows:
+                                    for cell in row.cells:
+                                        for p in cell.paragraphs:
+                                            self._apply_docx_format(p, {}, params)
+                                summaries.append(f"Formatted text in table {table_idx + 1}")
+                                changed = True
+
+                    elif op_type == "table_op":
+                        summary = self._op_docx_table(doc, tgt, params)
+                        if summary:
+                            summaries.append(summary)
                             changed = True
 
-                elif op_type == "table_op":
-                    summary = self._op_docx_table(doc, tgt, params)
-                    if summary:
-                        summaries.append(summary)
-                        changed = True
+                    elif op_type == "ai_design_op":
+                        summary = self._op_docx_ai_design(doc, params)
+                        if summary:
+                            summaries.append(summary)
+                            changed = True
 
-                elif op_type == "ai_design_op":
-                    summary = self._op_docx_ai_design(doc, params)
-                    if summary:
-                        summaries.append(summary)
-                        changed = True
+                    elif op_type == "theme_op":
+                        summary = self._op_docx_theme(doc, params)
+                        if summary:
+                            summaries.append(summary)
+                            changed = True
 
-                elif op_type == "theme_op":
-                    summary = self._op_docx_theme(doc, params)
-                    if summary:
-                        summaries.append(summary)
-                        changed = True
+                    elif op_type == "image_op":
+                        summary = self._op_docx_image(doc, tgt, params)
+                        if summary:
+                            summaries.append(summary)
+                            changed = True
 
-                elif op_type == "image_op":
-                    summary = self._op_docx_image(doc, tgt, params)
-                    if summary:
-                        summaries.append(summary)
-                        changed = True
+                    elif op_type == "meta_op":
+                        from app.services.docx_extensions import apply_metadata
+                        summary = apply_metadata(doc, params)
+                        if summary:
+                            summaries.append(summary)
+                            changed = True
 
-                elif op_type == "layout_op":
-                    summary = self._op_docx_layout(doc, params)
-                    if summary:
-                        summaries.append(summary)
-                        changed = True
+                    elif op_type == "section_op":
+                        from app.services.docx_extensions import apply_section_formatting
+                        target_id = op.get("target_id")
+                        summary = apply_section_formatting(doc, target_id, params)
+                        if summary:
+                            summaries.append(summary)
+                            changed = True
 
-                elif op_type == "list_op":
-                    summary = self._op_docx_list(doc, params)
-                    if summary:
-                        summaries.append(summary)
-                        changed = True
+                    elif op_type == "style_op":
+                        from app.services.docx_extensions import apply_global_style
+                        summary = apply_global_style(doc, params)
+                        if summary:
+                            summaries.append(summary)
+                            changed = True
+                            changed = True
 
-                elif op_type == "find_replace":
-                    summary = self._op_docx_find_replace(doc, tgt, params)
-                    if summary:
-                        summaries.append(summary)
-                        changed = True
+                    elif op_type == "layout_op":
+                        summary = self._op_docx_layout(doc, params)
+                        if summary:
+                            summaries.append(summary)
+                            changed = True
 
-                elif op_type == "slide_op":
-                    # DOCX doesn't have slides; skip gracefully
-                    summaries.append("Slide operations are only supported for PPTX files.")
+                    elif op_type == "list_op":
+                        summary = self._op_docx_list(doc, params)
+                        if summary:
+                            summaries.append(summary)
+                            changed = True
 
-                elif op_type == "needs_image":
-                    pass
+                    elif op_type == "find_replace":
+                        summary = self._op_docx_find_replace(doc, tgt, params)
+                        if summary:
+                            summaries.append(summary)
+                            changed = True
 
-            except Exception as exc:
-                log.exception("DOCX op %r failed: %s", op_type, exc)
+                    elif op_type == "slide_op":
+                        # DOCX doesn't have slides; skip gracefully
+                        summaries.append("Slide operations are only supported for PPTX files.")
+
+                    elif op_type == "needs_image":
+                        pass
+
+                except Exception as exc:
+                    log.exception("DOCX op %r failed: %s", op_type, exc)
 
         if changed:
             doc.save(target)
@@ -1099,10 +1169,10 @@ class DocumentProcessor:
         WNS_TBL = qn('w:tbl')
         WNS_DRAWING = qn('w:drawing')
 
-        para_counter = 0
-        table_counter = 0
-        image_counter = 0
-        other_counter = 0
+        para_counter = 1
+        table_counter = 1
+        image_counter = 1
+        other_counter = 1
         result = []
         for child in doc.element.body:
             tag = child.tag
@@ -1114,7 +1184,7 @@ class DocumentProcessor:
                     image_counter += 1
                 else:
                     result.append((f"paragraph_{para_counter}", child))
-                    para_counter += 1
+                para_counter += 1
             elif tag == WNS_TBL:
                 result.append((f"table_{table_counter}", child))
                 table_counter += 1
@@ -2632,6 +2702,29 @@ class DocumentProcessor:
             if space_after is not None:
                 from docx.shared import Pt
                 para.paragraph_format.space_after = Pt(float(space_after))
+                
+            left_indent = params.get("left_indent_pt")
+            if left_indent is not None:
+                from docx.shared import Pt
+                para.paragraph_format.left_indent = Pt(float(left_indent))
+                
+            right_indent = params.get("right_indent_pt")
+            if right_indent is not None:
+                from docx.shared import Pt
+                para.paragraph_format.right_indent = Pt(float(right_indent))
+                
+            first_line_indent = params.get("first_line_indent_pt")
+            if first_line_indent is not None:
+                from docx.shared import Pt
+                para.paragraph_format.first_line_indent = Pt(float(first_line_indent))
+                
+            keep_with_next = params.get("keep_with_next")
+            if keep_with_next is not None:
+                para.paragraph_format.keep_with_next = bool(keep_with_next)
+                
+            keep_together = params.get("keep_together")
+            if keep_together is not None:
+                para.paragraph_format.keep_together = bool(keep_together)
 
             include_in_toc = params.get("include_in_toc")
             if include_in_toc is not None:
@@ -2695,6 +2788,7 @@ class DocumentProcessor:
             if params.get("font_family"):
                 run.font.name = params["font_family"]
             if params.get("font_size_pt") is not None:
+                from docx.shared import Pt
                 run.font.size = Pt(params["font_size_pt"])
             if color_hex and len(color_hex) == 6:
                 try:
@@ -2877,7 +2971,7 @@ class DocumentProcessor:
                 
                 summaries.append(f"Set width of table {t_idx} to {int(width_pct*100)}%")
 
-            elif action == "set_cell_bg" or action == "alternate_rows" or action == "set_header_format":
+            elif action in ["set_cell_bg", "alternate_rows", "set_header_format", "apply_theme"]:
                 # For simplicity, we implement some basic iteration
                 from docx.oxml.ns import nsdecls
                 from docx.oxml import parse_xml
@@ -2935,32 +3029,8 @@ class DocumentProcessor:
                         pass
 
             elif action == "set_borders":
-                color = str(params.get("border_color_hex", "000000")).strip().lstrip("#").upper()
-                width_pt = max(4, int(params.get("border_width_pt", 1) * 8)) # 1/8th pt, min 1/2 pt
-                try:
-                    from docx.oxml import parse_xml
-                    from docx.oxml.ns import nsdecls
-                    tblBorders = parse_xml(
-                        r'<w:tblBorders %s>'
-                        r'<w:top w:val="single" w:sz="%d" w:space="0" w:color="%s"/>'
-                        r'<w:left w:val="single" w:sz="%d" w:space="0" w:color="%s"/>'
-                        r'<w:bottom w:val="single" w:sz="%d" w:space="0" w:color="%s"/>'
-                        r'<w:right w:val="single" w:sz="%d" w:space="0" w:color="%s"/>'
-                        r'<w:insideH w:val="single" w:sz="%d" w:space="0" w:color="%s"/>'
-                        r'<w:insideV w:val="single" w:sz="%d" w:space="0" w:color="%s"/>'
-                        r'</w:tblBorders>' % (
-                            nsdecls('w'),
-                            width_pt, color, width_pt, color, width_pt, color, width_pt, color, width_pt, color, width_pt, color
-                        )
-                    )
-                    tblPr = tbl._tbl.tblPr
-                    existing = tblPr.find("{http://schemas.openxmlformats.org/wordprocessingml/2006/main}tblBorders")
-                    if existing is not None:
-                        tblPr.remove(existing)
-                    tblPr.append(tblBorders)
-                    summaries.append(f"Set borders for table {t_idx}")
-                except Exception as e:
-                    summaries.append(f"Failed to set borders: {e}")
+                # We handle borders at the end of the loop now
+                pass
 
             elif action == "set_cell_alignment":
                 alignment = params.get("cell_alignment")
@@ -2979,12 +3049,73 @@ class DocumentProcessor:
                                     p.alignment = align_map[alignment]
                     summaries.append(f"Aligned text in table {t_idx} to {alignment}")
 
+            # --- Universal Table Modifiers ---
+            cell_bg = params.get("cell_bg_hex")
+            if cell_bg:
+                color = str(cell_bg).lstrip("#").upper()
+                for row in tbl.rows:
+                    for cell in row.cells:
+                        from docx.oxml.shared import OxmlElement, qn
+                        tcPr = cell._tc.get_or_add_tcPr()
+                        shd = OxmlElement("w:shd")
+                        shd.set(qn("w:val"), "clear")
+                        shd.set(qn("w:color"), "auto")
+                        shd.set(qn("w:fill"), color)
+                        tcPr.append(shd)
+                summaries.append(f"Set cell background to {color} for table {t_idx}")
+
+            valign = params.get("cell_vertical_alignment")
+            if valign:
+                from docx.enum.table import WD_ALIGN_VERTICAL
+                valign_map = {
+                    "top": WD_ALIGN_VERTICAL.TOP,
+                    "center": WD_ALIGN_VERTICAL.CENTER,
+                    "bottom": WD_ALIGN_VERTICAL.BOTTOM
+                }
+                if valign in valign_map:
+                    for row in tbl.rows:
+                        for cell in row.cells:
+                            cell.vertical_alignment = valign_map[valign]
+                    summaries.append(f"Set vertical alignment to {valign} for table {t_idx}")
+            
+            border_hex = params.get("border_color_hex")
+            if border_hex:
+                border_color = str(border_hex).lstrip("#").upper()
+                border_sz = str(int(params.get("border_width_pt", 12)))
+                from docx.oxml.shared import OxmlElement, qn
+                tblPr = tbl._element.xpath('w:tblPr')
+                if tblPr:
+                    tblBorders = OxmlElement('w:tblBorders')
+                    for border_name in ['top', 'left', 'bottom', 'right', 'insideH', 'insideV']:
+                        border = OxmlElement(f'w:{border_name}')
+                        border.set(qn('w:val'), 'single')
+                        border.set(qn('w:sz'), border_sz)
+                        border.set(qn('w:space'), '0')
+                        border.set(qn('w:color'), border_color)
+                        tblBorders.append(border)
+                    # replace existing
+                    old_borders = tblPr[0].xpath('w:tblBorders')
+                    if old_borders:
+                        tblPr[0].replace(old_borders[0], tblBorders)
+                    else:
+                        tblPr[0].append(tblBorders)
+                summaries.append(f"Applied {border_color} borders to table {t_idx}")
+
+            col_width = params.get("col_width_inches")
+            if col_width is not None:
+                from docx.shared import Inches
+                for row in tbl.rows:
+                    for cell in row.cells:
+                        cell.width = Inches(float(col_width))
+                summaries.append(f"Set column width to {col_width} inches for table {t_idx}")
+
         return "; ".join(summaries)
 
     def _op_docx_ai_design(self, doc, params: dict) -> str:
         action = params.get("action", "normalize_fonts")
         
         if action == "normalize_fonts":
+            from docx.shared import Pt
             font_family = params.get("target_font", "Calibri")
             base_size = params.get("base_font_size_pt", 11)
             for para in doc.paragraphs:
@@ -3749,12 +3880,43 @@ class DocumentProcessor:
         doc = Document(path)
         children = []
 
+        from app.services.docx_extensions import extract_metadata
+        metadata_node = extract_metadata(doc)
+        if metadata_node:
+            children.append({
+                "id": "metadata",
+                "type": "metadata",
+                "role": "metadata",
+                "properties": metadata_node
+            })
+        
+        # Extract basic section info
+        for s_idx, section in enumerate(doc.sections):
+            sec_style = {}
+            try:
+                sec_style["orientation"] = section.orientation.name if hasattr(section, 'orientation') else "PORTRAIT"
+                if hasattr(section.page_width, 'inches'): sec_style["page_width_inches"] = round(section.page_width.inches, 2)
+                if hasattr(section.page_height, 'inches'): sec_style["page_height_inches"] = round(section.page_height.inches, 2)
+                if hasattr(section.top_margin, 'inches'): sec_style["top_margin_inches"] = round(section.top_margin.inches, 2)
+                if hasattr(section.bottom_margin, 'inches'): sec_style["bottom_margin_inches"] = round(section.bottom_margin.inches, 2)
+                if hasattr(section.left_margin, 'inches'): sec_style["left_margin_inches"] = round(section.left_margin.inches, 2)
+                if hasattr(section.right_margin, 'inches'): sec_style["right_margin_inches"] = round(section.right_margin.inches, 2)
+            except Exception:
+                pass
+            
+            children.append({
+                "id": f"section_{s_idx}",
+                "type": "section",
+                "role": "section",
+                "style": sec_style
+            })
+
         # Build lookup maps: xml element → python-docx object
-        para_elements = {p._p: (idx, p) for idx, p in enumerate(doc.paragraphs)}
-        table_elements = {t._tbl: (idx, t) for idx, t in enumerate(doc.tables)}
+        para_elements = {p._p: (idx + 1, p) for idx, p in enumerate(doc.paragraphs)}
+        table_elements = {t._tbl: (idx + 1, t) for idx, t in enumerate(doc.tables)}
 
         body_index = 0  # sequential position across all body children
-        image_counter = 0  # counter for image_N IDs
+        image_counter = 1  # counter for image_N IDs
         WNS_DRAWING = _qn('w:drawing')
 
         for child in doc.element.body:
@@ -3818,6 +3980,9 @@ class DocumentProcessor:
                                 "size": font_size,
                                 "bold": font.bold,
                                 "italic": font.italic,
+                                "underline": font.underline,
+                                "strike": font.strike,
+                                "highlight": str(font.highlight_color) if font.highlight_color else None,
                                 "color": color_hex,
                             },
                         })
@@ -3852,6 +4017,23 @@ class DocumentProcessor:
                     except Exception:
                         pass
 
+                    space_before_pt = None
+                    try:
+                        if para.paragraph_format.space_before is not None:
+                            space_before_pt = para.paragraph_format.space_before.pt
+                    except Exception:
+                        pass
+
+                    space_after_pt = None
+                    try:
+                        if para.paragraph_format.space_after is not None:
+                            space_after_pt = para.paragraph_format.space_after.pt
+                    except Exception:
+                        pass
+                    
+                    from app.services.docx_extensions import extract_advanced_paragraph_style
+                    adv_style = extract_advanced_paragraph_style(para)
+
                     node = {
                         "id": f"paragraph_{idx}",
                         "body_index": body_index,
@@ -3863,6 +4045,9 @@ class DocumentProcessor:
                             "alignment": alignment,
                             "line_spacing": line_spacing,
                             "page_break_before": page_break_before,
+                            "space_before_pt": space_before_pt,
+                            "space_after_pt": space_after_pt,
+                            **adv_style
                         },
                         "runs": runs,
                     }
@@ -3911,6 +4096,9 @@ class DocumentProcessor:
                                         "size": font_size,
                                         "bold": font.bold,
                                         "italic": font.italic,
+                                        "underline": font.underline,
+                                        "strike": font.strike,
+                                        "highlight": str(font.highlight_color) if font.highlight_color else None,
                                         "color": color_hex,
                                     },
                                 })
@@ -3933,16 +4121,37 @@ class DocumentProcessor:
                                 "style": {
                                     "alignment": alignment,
                                     "line_spacing": line_spacing,
+                                    "page_break_before": para.paragraph_format.page_break_before if hasattr(para.paragraph_format, "page_break_before") else None,
+                                    "space_before_pt": para.paragraph_format.space_before.pt if getattr(para.paragraph_format, "space_before", None) is not None else None,
+                                    "space_after_pt": para.paragraph_format.space_after.pt if getattr(para.paragraph_format, "space_after", None) is not None else None,
                                 },
                                 "runs": runs,
                             })
-                        cells.append({
+                        cell_dict = {
                             "id": f"table_{t_idx}_cell_{r_idx}_{c_idx}",
                             "type": "cell",
                             "row": r_idx,
                             "column": c_idx,
                             "children": cell_paras,
-                        })
+                        }
+                        
+                        try:
+                            tcPr = cell._tc.get_or_add_tcPr()
+                            shd = tcPr.find("{http://schemas.openxmlformats.org/wordprocessingml/2006/main}shd")
+                            if shd is not None:
+                                fill = shd.get("{http://schemas.openxmlformats.org/wordprocessingml/2006/main}fill")
+                                if fill and fill != "auto":
+                                    cell_dict["bg_color"] = fill
+                        except Exception:
+                            pass
+                        
+                        try:
+                            if cell.vertical_alignment is not None:
+                                cell_dict["vertical_alignment"] = cell.vertical_alignment.name
+                        except Exception:
+                            pass
+                        
+                        cells.append(cell_dict)
                     rows.append({
                         "id": f"table_{t_idx}_row_{r_idx}",
                         "type": "row",
@@ -3950,15 +4159,36 @@ class DocumentProcessor:
                         "cells": cells,
                     })
 
-                children.append({
+                table_style_name = table.style.name if table.style else "Normal Table"
+                node = {
                     "id": f"table_{t_idx}",
                     "body_index": body_index,
                     "type": "table",
                     "role": "table",
+                    "style": {"style_name": table_style_name},
                     "row_count": len(table.rows),
                     "col_count": len(table.columns) if table.rows else 0,
                     "rows": rows,
-                })
+                }
+                
+                try:
+                    tblBorders = table._tbl.tblPr.find("{http://schemas.openxmlformats.org/wordprocessingml/2006/main}tblBorders")
+                    if tblBorders is not None:
+                        node["style"]["has_custom_borders"] = True
+                        # check colors of borders
+                        border_colors = set()
+                        for b_type in ["top", "left", "bottom", "right", "insideH", "insideV"]:
+                            b_el = tblBorders.find(f"{{http://schemas.openxmlformats.org/wordprocessingml/2006/main}}{b_type}")
+                            if b_el is not None:
+                                c = b_el.get("{http://schemas.openxmlformats.org/wordprocessingml/2006/main}color")
+                                if c and c != "auto":
+                                    border_colors.add(c)
+                        if border_colors:
+                            node["style"]["border_colors"] = list(border_colors)
+                except Exception:
+                    pass
+
+                children.append(node)
 
             # Increment body_index for every body child regardless of type
             body_index += 1

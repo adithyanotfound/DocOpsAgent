@@ -37,13 +37,15 @@ export async function deleteWorkspace(id: string): Promise<void> {
   }
 }
 
-export async function startChat(workspaceId: string, content: string, image?: File): Promise<{ run_id: string }> {
+export async function startChat(workspaceId: string, content: string, image?: File, provider?: string, model?: string): Promise<{ run_id: string }> {
   const form = new FormData();
   form.append("workspace_id", workspaceId);
   form.append("content", content);
   if (image) {
     form.append("image", image);
   }
+  if (provider) form.append("provider", provider);
+  if (model) form.append("model", model);
   return parse<{ run_id: string }>(
     await fetch(`${API_BASE}/api/chat`, {
       method: "POST",
