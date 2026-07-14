@@ -28,7 +28,7 @@ _TEXT_EDIT_SCHEMA = """Return a JSON array of text_edit operations:
     "op_type": "text_edit",
     "target_id": "element_id_to_edit" or ["id1", "id2"],
     "parameters": {
-      "new_text": "The complete new rewritten text content"
+      "new_text": "The complete new rewritten text content. NEVER use HTML tags (e.g. <b>, <span>) or Markdown here. NEVER use this tool to change fonts, colors, alignment, or spacing - use text_format for that!"
     }
   }
 ]
@@ -38,8 +38,10 @@ _TEXT_FORMAT_SCHEMA = """Return a JSON array of text_format operations:
 [
   {
     "op_type": "text_format",
-    "target_id": "element_id_to_format" or ["id1", "id2"],
+    "target_id": "element_id_to_format" or "all" or ["id1", "id2"],
     "parameters": {
+      "match_text": "exact substring to format (optional, if omitted formats the entire element)",
+      "match_role": "heading" or "bullet_point" or "body" (optional),
       "bold": true/false/null,
       "italic": true/false/null,
       "underline": true/false/null,
@@ -49,7 +51,9 @@ _TEXT_FORMAT_SCHEMA = """Return a JSON array of text_format operations:
       "highlight_hex": "FFFF00" (6-char hex) or null,
       "alignment": "left"/"center"/"right"/"justify" or null,
       "line_spacing": 1.5 or null,
-      "char_spacing": 1.0 or null
+      "char_spacing": 1.0 or null,
+      "space_before_pt": 12.0 or null,
+      "space_after_pt": 12.0 or null
     }
   }
 ]
@@ -61,14 +65,21 @@ _TABLE_OP_SCHEMA = """Return a JSON array of table_op operations:
     "op_type": "table_op",
     "target_id": "table_element_id_or_null" or ["id1", "id2"],
     "parameters": {
-      "action": "create"|"delete"|"add_row"|"remove_row"|"add_col"|"remove_col"|"merge_cells"|"set_cell_bg"|"set_borders"|"alternate_rows"|"populate"|"sort_data"|"apply_theme"|"set_header_format",
+      "action": "create"|"delete"|"add_row"|"remove_row"|"add_col"|"remove_col"|"merge_cells"|"set_cell_bg"|"set_borders"|"alternate_rows"|"populate"|"sort_data"|"apply_theme"|"set_header_format"|"set_cell_alignment"|"set_alignment"|"set_width_pct",
+      "action_notes": "set_header_format makes the first row dark blue with white text. set_cell_bg sets the background of a specific row/col.",
       "rows": number_of_rows_or_null,
       "cols": number_of_cols_or_null,
       "header_row": true/false/null,
       "alternate_row_colors": ["FFFFFF", "F0F0F0"] or null,
       "data": [["cell1", "cell2"], ["cell3", "cell4"]] or null,
-      "row_index": index_or_null,
-      "col_index": index_or_null,
+      "row_index": "0-based index or null",
+      "col_index": "0-based index or null",
+      "sort_by_column": "Name of the column to sort by (for sort_data)",
+      "cell_alignment": "left|center|right|justify (for set_cell_alignment)",
+      "alignment": "left|center|right (for set_alignment of the entire table)",
+      "width_pct": 1.0,
+      "before_id": "id_of_anchor_to_insert_before",
+      "after_id": "id_of_anchor_to_insert_after",
       "cell_bg_hex": "HEX" or null,
       "border_color_hex": "HEX" or null,
       "theme_color_hex": "HEX" or null,
@@ -107,7 +118,7 @@ _LAYOUT_OP_SCHEMA = """Return a JSON array of layout_op operations:
 [
   {
     "op_type": "layout_op",
-    "target_id": null,
+    "target_id": "null or 'all' or list of IDs",
     "parameters": {
       "action": "move_block"|"insert_page_break"|"remove_block"|"duplicate_block"|"insert_block"|"insert_toc",
       "start_id": "id_of_first_element_to_move_or_remove",
@@ -116,7 +127,8 @@ _LAYOUT_OP_SCHEMA = """Return a JSON array of layout_op operations:
       "after_id": "id_of_anchor_to_insert_after",
       "data": [
         {"role": "heading", "text": "Heading text", "heading_level": 2},
-        {"role": "body", "text": "Paragraph content text"}
+        {"role": "body", "text": "Paragraph content text"},
+        {"role": "table", "headers": ["Col 1", "Col 2"], "rows": [["A", "B"], ["C", "D"]]}
       ]
     }
   }
@@ -127,12 +139,12 @@ _LIST_OP_SCHEMA = """Return a JSON array of list_op operations:
 [
   {
     "op_type": "list_op",
-    "target_id": null,
+    "target_id": "null or 'all' or list of IDs",
     "parameters": {
       "action": "convert_type"|"add_items"|"sort_items"|"set_bullet_char",
       "start_id": "first_item_element_id_or_null",
       "end_id": "last_item_element_id_or_null",
-      "anchor_id": "insert_after_this_element_id_or_null",
+      "after_id": "insert_after_this_element_id_or_null",
       "list_type": "bullet"|"numbered"|"checklist",
       "items": ["list item 1 text", "list item 2 text"],
       "bullet_char": "char_or_null"
@@ -160,7 +172,7 @@ _THEME_OP_SCHEMA = """Return a JSON array of theme_op operations:
 [
   {
     "op_type": "theme_op",
-    "target_id": null,
+    "target_id": "null or 'all' or list of IDs",
     "parameters": {
       "action": "set_bg_color"|"set_margins"|"add_page_numbers"|"apply_theme_colors",
       "bg_color_hex": "HEX_or_null",
@@ -225,36 +237,37 @@ _SYSTEM_PROMPT = """You are a precise document editing operations generator.
 You convert document editing instructions into a list of structured operations.
 
 Available Operation Types:
-1. text_edit: Rewrite text content of a targeted paragraph.
-   - target_id: paragraph element ID
+1. text_edit: Rewrite text content of a targeted paragraph. NEVER use this tool to change fonts, colors, or alignment - use text_format for that!
+   - target_id: paragraph element ID or list of IDs
    - parameters: { new_text: str }
 
 2. text_format: Apply formatting to a paragraph.
-   - target_id: paragraph element ID
-   - parameters: { bold: bool, italic: bool, underline: bool, strikethrough: bool, font_family: str, font_size_pt: float, color_hex: str, highlight_hex: str, alignment: 'left'|'center'|'right'|'justify', line_spacing: float, char_spacing: float }
+   - target_id: paragraph element ID or list of IDs
+   - parameters: { bold: bool, italic: bool, underline: bool, strikethrough: bool, font_family: str, font_size_pt: float, color_hex: str, highlight_hex: str, alignment: 'left'|'center'|'right'|'justify', line_spacing: float, char_spacing: float, space_before_pt: float, space_after_pt: float, match_role: str }
 
 3. table_op: Create, modify or style tables.
    - target_id: table element ID (or null for insert) or list of IDs
-   - parameters: { action: 'create'|'delete'|'add_row'|'remove_row'|'add_col'|'remove_col'|'merge_cells'|'set_cell_bg'|'set_borders'|'alternate_rows'|'populate'|'sort_data'|'apply_theme'|'set_header_format', rows: int, cols: int, alternate_row_colors: list[str], data: list[list[str]], cell_bg_hex: str, border_color_hex: str, theme_color_hex: str, border_width_pt: float }
+   - parameters: { action: 'create'|'delete'|'add_row'|'remove_row'|'add_col'|'remove_col'|'merge_cells'|'set_cell_bg'|'set_borders'|'alternate_rows'|'populate'|'sort_data'|'apply_theme'|'set_header_format'|'set_alignment'|'set_width_pct', alignment: 'left'|'center'|'right', width_pct: float, rows: int, cols: int, before_id: str, after_id: str, alternate_row_colors: list[str], data: list[list[str]], cell_bg_hex: str, border_color_hex: str, theme_color_hex: str, border_width_pt: float }
 
 4. image_op: Insert or style images.
    - target_id: image element ID (or null for insert) or list of IDs
    - parameters: { action: 'insert'|'replace'|'remove'|'resize'|'reposition'|'rounded_corners'|'shadow', image_path: str, position: { left_pct: float, top_pct: float, width_pct: float, height_pct: float } }
 
 5. layout_op: Manipulate document pages / section order.
-   - target_id: null
+   - target_id: null or 'all' or list of IDs
    - parameters: { action: 'move_block'|'insert_page_break'|'remove_block'|'duplicate_block'|'insert_block'|'insert_toc', start_id: str, end_id: str, before_id: str, after_id: str, data: list[dict] }
+     (data array for insert_block supports {"role": "heading", "text": "..."}, {"role": "body", "text": "..."}, {"role": "table", "headers": [...], "rows": [...]})
 
 6. list_op: List manipulations.
-   - target_id: null
-   - parameters: { action: 'convert_type'|'add_items'|'sort_items'|'set_bullet_char', start_id: str, end_id: str, anchor_id: str, list_type: 'bullet'|'numbered'|'checklist', items: list[str] }
+   - target_id: null or 'all' or list of IDs
+   - parameters: { action: 'convert_type'|'add_items'|'sort_items'|'set_bullet_char', start_id: str, end_id: str, after_id: str, list_type: 'bullet'|'numbered'|'checklist', items: list[str] }
 
 7. find_replace: Global search and replace.
    - target_id: 'all'
    - parameters: { find_text: str, replace_text: str, is_regex: bool }
 
 8. theme_op: Theme setting operations.
-   - target_id: null
+   - target_id: null or 'all' or list of IDs
    - parameters: { action: 'set_bg_color'|'set_margins'|'add_page_numbers'|'apply_theme_colors', bg_color_hex: str, margin_inches: float }
 
 Return ONLY a JSON array of operations.

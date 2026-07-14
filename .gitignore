@@ -7,3 +7,4 @@ frontend/dist/
 storage/
 .DS_Store
 *.env
+__pycache__

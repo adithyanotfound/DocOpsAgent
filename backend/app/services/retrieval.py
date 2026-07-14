@@ -34,9 +34,9 @@ class RetrievalService:
             from app.services.embedding_client import GeminiEmbeddingClient
             return GeminiEmbeddingClient()
         else:
-            # Fallback to legacy OpenAI embedding method using the legacy EmbeddingClient from llm_client
-            from app.services.llm_client import EmbeddingClient
-            return EmbeddingClient()
+            # Fallback to OpenAI embedding method
+            from app.services.embedding_client import OpenAIEmbeddingClient
+            return OpenAIEmbeddingClient()
 
     # ------------------------------------------------------------------
     # Public API
@@ -161,12 +161,12 @@ class RetrievalService:
 
         qdrant = self._get_qdrant_client()
 
-        results = qdrant.search(
+        results = qdrant.query_points(
             collection_name=COLLECTION_NAME,
-            query_vector=query_vector,
+            query=query_vector,
             limit=limit,
             score_threshold=0.45,
-        )
+        ).points
 
         found: list[dict] = []
         for hit in results:

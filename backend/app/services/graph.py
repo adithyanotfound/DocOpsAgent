@@ -573,18 +573,35 @@ class DocumentAgentGraph:
         }
 
         # If repair is needed, reset the staged loop states
-        if not verify_result["all_satisfied"] and state["iteration"] < MAX_ITERATIONS:
-            result_feedback = {}
-            for item in verify_result.get("tasks", []):
-                if not item["satisfied"]:
-                    result_feedback[item["index"]] = item["feedback"]
-            
-            return_state.update({
-                "iteration": state["iteration"] + 1,
-                "current_task_index": 0,
-                "accumulated_ops": [],
-                "failed_tasks_feedback": result_feedback,
-            })
+        if not verify_result["all_satisfied"]:
+            if state["iteration"] < MAX_ITERATIONS:
+                result_feedback = {}
+                first_failed_idx = len(state["tasks"])
+                for item in verify_result.get("tasks", []):
+                    if not item["satisfied"]:
+                        result_feedback[item["index"]] = item["feedback"]
+                        if item["index"] < first_failed_idx:
+                            first_failed_idx = item["index"]
+                
+                new_accumulated_ops = []
+                for i in range(first_failed_idx):
+                    if i < len(state.get("task_results", [])):
+                        new_accumulated_ops.extend(state["task_results"][i].get("ops", []))
+                
+                baseline_path = self.storage.version_document_path(state["workspace_id"], state["current_version"], state["document_type"])
+                
+                return_state.update({
+                    "iteration": state["iteration"] + 1,
+                    "current_task_index": first_failed_idx,
+                    "accumulated_ops": new_accumulated_ops,
+                    "failed_tasks_feedback": result_feedback,
+                    "source_document_path": str(baseline_path),
+                })
+            else:
+                # We reached max iterations. Do not reset source_document_path
+                return_state.update({
+                    "iteration": state["iteration"] + 1,
+                })
 
         return return_state
 
@@ -668,8 +685,7 @@ class DocumentAgentGraph:
         if review["satisfied"]:
             thought2 = "✓ The slide plan looks good — proceeding to apply."
         else:
-            next_iter = state["iteration"] + 1
-            if next_iter >= MAX_ITERATIONS:
+            if state["iteration"] >= MAX_ITERATIONS:
                 thought2 = f"Max refinement rounds reached. Will apply current plan."
             else:
                 feedback = review.get("feedback", "")
@@ -680,6 +696,7 @@ class DocumentAgentGraph:
         return {
             "review": review,
             "satisfied": review["satisfied"],
+            "iteration": state["iteration"] + 1,
             "thoughts": state["thoughts"] + [thought, thought2],
         }
 
@@ -753,7 +770,7 @@ class DocumentAgentGraph:
 
     def _should_continue_v3(self, state: AgentState) -> str:
         result = state["verify_result"]
-        if result.get("all_satisfied") or state["iteration"] >= MAX_ITERATIONS:
+        if result.get("all_satisfied") or state["iteration"] > MAX_ITERATIONS:
             return "commit"
         
         return "repair"
@@ -761,7 +778,7 @@ class DocumentAgentGraph:
     def _should_continue_generate(self, state: AgentState) -> str:
         if state.get("satisfied"):
             return "commit"
-        if state["iteration"] >= MAX_ITERATIONS:
+        if state["iteration"] > MAX_ITERATIONS:
             return "commit"
         return "refine"
 

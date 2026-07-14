@@ -89,13 +89,13 @@ class ReferenceResolver:
             return list(indices.get("images_by_ordinal", {}).values())
 
         # Match "last paragraph" or "last element"
-        if hint in ("last paragraph", "last element", "end of document", "the end"):
+        if hint in ("last paragraph", "last element", "end of document", "the end", "the end of the document"):
             last_id = indices.get("last_element_id")
             if last_id:
                 return [last_id]
 
         # Match "first paragraph" or "first element"
-        if hint in ("first paragraph", "first element", "beginning of document", "the beginning"):
+        if hint in ("first paragraph", "first element", "beginning of document", "the beginning", "the beginning of the document", "start of document"):
             first_id = indices.get("first_content_id")
             if first_id:
                 return [first_id]

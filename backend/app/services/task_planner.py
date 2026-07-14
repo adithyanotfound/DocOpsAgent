@@ -18,7 +18,7 @@ Given a user request, chat history, and a document outline, decompose the reques
 an ordered list of atomic tasks. Each task represents one discrete change.
 
 Available task types:
-- text_edit: Rewrite text content of a specific element (editing text, sentences, paragraphs)
+- text_edit: Rewrite text content of a specific element (editing text, sentences, paragraphs). NEVER use this for formatting (fonts, colors, alignment, spacing) - use text_format instead!
 - text_format: Change formatting (bold, color, font, size, alignment, margins, spacing, bullets, etc.)
 - table_op: Create, modify, or delete tables, columns, rows, or cell contents/styling
 - image_op: Insert, replace, resize, style, reposition, or remove images
@@ -41,10 +41,11 @@ For each task, provide:
 
 CRITICAL RULES:
 1. Decompose EVERY distinct action in the request. If the user says "add page break before Action Items, change all headings to green, and move Table 1 to the end", you MUST output 3 separate tasks.
-2. Ordering matters: tasks must be ordered logically so they can be executed sequentially.
-3. Be precise with target_hint so the resolver can map them accurately. Use ordinal indicators from the outline (like "Table 1", "Section 2") if present.
-4. DO NOT create image_op tasks (like adding or replacing images/logos) unless the user EXPLICITLY asks you to add, replace, or modify an image. Do not invent image tasks to "improve" the document.
-5. KNOW YOUR LIMITATIONS: The document engine natively supports:
+2. Group repetitive actions: If adding multiple items to the same list, or applying the same format to a group of elements, combine them into a SINGLE task (e.g., "Add 3 new bullet points to the Highlights list"). Do NOT split them into one task per item.
+3. Ordering matters: tasks must be ordered logically so they can be executed sequentially.
+4. Be precise with target_hint so the resolver can map them accurately. Use ordinal indicators from the outline (like "Table 1", "Section 2") if present. If the request applies to all instances of a type (e.g., "all headings", "all tables", "all images"), use exactly that phrase for target_hint (e.g., "all headings"). Do NOT use "entire document" for these.
+5. DO NOT create image_op tasks (like adding or replacing images/logos) unless the user EXPLICITLY asks you to add, replace, or modify an image. Do not invent image tasks to "improve" the document.
+6. KNOW YOUR LIMITATIONS: The document engine natively supports:
    - Text: bold, italic, underline, strikethrough, highlight_color, font name, font size (pt), and font color (RGB hex).
    - Paragraphs: left/center/right/justify align, space before/after (pt), line spacing (e.g., 1.5), page breaks, left/right/first-line indents (pt), and keep with next / keep together.
    - Tables: modify columns/rows, cell text formatting, cell backgrounds, cell vertical alignments, column widths, row alternate colors, header formatting, and borders.

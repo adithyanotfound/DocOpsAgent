@@ -115,3 +115,36 @@ class GeminiEmbeddingClient:
         and its matching document land close together in vector space.
         """
         return f"task: {task} | {role}: {text}"
+
+class OpenAIEmbeddingClient:
+    """Embedding client for OpenAI."""
+
+    def __init__(self) -> None:
+        from openai import OpenAI
+        if not settings.openai_api_key:
+            raise RuntimeError(
+                "OPENAI_API_KEY is not set. Required for OpenAIEmbeddingClient."
+            )
+        self._client = OpenAI(
+            api_key=settings.openai_api_key,
+            base_url=settings.openai_base_url or None,
+        )
+        self.model = settings.embedding_model or "text-embedding-3-small"
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        if not texts:
+            return []
+        try:
+            res = self._client.embeddings.create(input=texts, model=self.model)
+            return [data.embedding for data in res.data]
+        except Exception as exc:
+            log.error("openai embed failed: %s", exc)
+            raise
+
+    def embed_query(self, text: str) -> list[float]:
+        try:
+            res = self._client.embeddings.create(input=[text], model=self.model)
+            return res.data[0].embedding
+        except Exception as exc:
+            log.error("openai query embed failed: %s", exc)
+            raise

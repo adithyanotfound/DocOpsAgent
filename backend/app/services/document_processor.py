@@ -894,6 +894,43 @@ class DocumentProcessor:
         changed = False
 
         for raw_op in operations:
+            op_type = raw_op.get("op_type", "")
+            
+            # Structural ops do not loop over target_ids
+            if op_type in {"list_op", "layout_op", "theme_op", "ai_design_op", "meta_op", "style_op", "find_replace", "slide_op"}:
+                params = raw_op.get("parameters", {})
+                if "target_id" in raw_op:
+                    params["_raw_target_id"] = raw_op.get("target_id")
+
+                try:
+                    summary = ""
+                    if op_type == "list_op":
+                        summary = self._op_docx_list(doc, params)
+                    elif op_type == "layout_op":
+                        summary = self._op_docx_layout(doc, params)
+                    elif op_type == "theme_op":
+                        summary = self._op_docx_theme(doc, params)
+                    elif op_type == "ai_design_op":
+                        summary = self._op_docx_ai_design(doc, params)
+                    elif op_type == "meta_op":
+                        from app.services.docx_extensions import apply_metadata
+                        summary = apply_metadata(doc, params)
+                    elif op_type == "style_op":
+                        from app.services.docx_extensions import apply_global_style
+                        summary = apply_global_style(doc, params)
+                    elif op_type == "find_replace":
+                        tgt = self._parse_target_id(raw_op.get("target_id") or "all")
+                        summary = self._op_docx_find_replace(doc, tgt, params)
+                    elif op_type == "slide_op":
+                        summary = "Slide operations are only supported for PPTX files."
+                    
+                    if summary:
+                        summaries.append(summary)
+                        changed = True
+                except Exception as exc:
+                    log.exception("Failed to apply structural operation %r: %s", op_type, exc)
+                continue
+
             target_ids = raw_op.get("target_id")
             if not isinstance(target_ids, list):
                 target_ids = [target_ids]
@@ -958,27 +995,8 @@ class DocumentProcessor:
                             summaries.append(summary)
                             changed = True
 
-                    elif op_type == "ai_design_op":
-                        summary = self._op_docx_ai_design(doc, params)
-                        if summary:
-                            summaries.append(summary)
-                            changed = True
-
-                    elif op_type == "theme_op":
-                        summary = self._op_docx_theme(doc, params)
-                        if summary:
-                            summaries.append(summary)
-                            changed = True
-
                     elif op_type == "image_op":
                         summary = self._op_docx_image(doc, tgt, params)
-                        if summary:
-                            summaries.append(summary)
-                            changed = True
-
-                    elif op_type == "meta_op":
-                        from app.services.docx_extensions import apply_metadata
-                        summary = apply_metadata(doc, params)
                         if summary:
                             summaries.append(summary)
                             changed = True
@@ -990,36 +1008,6 @@ class DocumentProcessor:
                         if summary:
                             summaries.append(summary)
                             changed = True
-
-                    elif op_type == "style_op":
-                        from app.services.docx_extensions import apply_global_style
-                        summary = apply_global_style(doc, params)
-                        if summary:
-                            summaries.append(summary)
-                            changed = True
-                            changed = True
-
-                    elif op_type == "layout_op":
-                        summary = self._op_docx_layout(doc, params)
-                        if summary:
-                            summaries.append(summary)
-                            changed = True
-
-                    elif op_type == "list_op":
-                        summary = self._op_docx_list(doc, params)
-                        if summary:
-                            summaries.append(summary)
-                            changed = True
-
-                    elif op_type == "find_replace":
-                        summary = self._op_docx_find_replace(doc, tgt, params)
-                        if summary:
-                            summaries.append(summary)
-                            changed = True
-
-                    elif op_type == "slide_op":
-                        # DOCX doesn't have slides; skip gracefully
-                        summaries.append("Slide operations are only supported for PPTX files.")
 
                     elif op_type == "needs_image":
                         pass
@@ -1081,6 +1069,38 @@ class DocumentProcessor:
                 run._r.append(fldChar2)
                 run._r.append(fldChar3)
             return "Added page numbers to footers"
+        elif action == "apply_theme_colors":
+            accent_colors = params.get("accent_colors", [])
+            if not accent_colors:
+                return "No theme colors provided"
+            color1 = str(accent_colors[0]).lstrip('#')
+            color2 = str(accent_colors[1]).lstrip('#') if len(accent_colors) > 1 else color1
+            
+            from docx.shared import RGBColor as DRGBColor
+            def _hex_to_rgb(hx):
+                if len(hx) == 6:
+                    try:
+                        return DRGBColor(int(hx[0:2],16), int(hx[2:4],16), int(hx[4:6],16))
+                    except ValueError:
+                        pass
+                return None
+
+            c1 = _hex_to_rgb(color1)
+            c2 = _hex_to_rgb(color2)
+            
+            if c1:
+                for para in doc.paragraphs:
+                    if para.style and para.style.name and para.style.name.lower().startswith("heading"):
+                        for run in para.runs:
+                            run.font.color.rgb = c1
+            if c2:
+                for tbl in doc.tables:
+                    if len(tbl.rows) > 0:
+                        for cell in tbl.rows[0].cells:
+                            for p in cell.paragraphs:
+                                for run in p.runs:
+                                    run.font.color.rgb = c2
+            return f"Applied theme colors {accent_colors}"
         return ""
 
     def _extract_list_info(self, para, doc) -> dict | None:
@@ -1774,6 +1794,15 @@ class DocumentProcessor:
         # ----------------------------------------------------------------
         elif action == 'add_items':
             after_id = params.get('after_id')  # anchor element ID
+            
+            # Fallback to _raw_target_id if after_id is missing
+            if not after_id:
+                raw_tgt = params.get('_raw_target_id')
+                if isinstance(raw_tgt, list) and raw_tgt:
+                    after_id = raw_tgt[-1]
+                elif isinstance(raw_tgt, str):
+                    after_id = raw_tgt
+
             items = params.get('items', [])     # list of text strings
             if not after_id:
                 return "add_items requires after_id"
@@ -2672,74 +2701,76 @@ class DocumentProcessor:
                 return False
                 
         match_text = params.get("match_text")
-        if not match_text:
-            alignment = params.get("alignment")
-            if alignment:
-                from docx.enum.text import WD_ALIGN_PARAGRAPH
-                align_map = {
-                    "left": WD_ALIGN_PARAGRAPH.LEFT,
-                    "center": WD_ALIGN_PARAGRAPH.CENTER,
-                    "right": WD_ALIGN_PARAGRAPH.RIGHT,
-                    "justify": WD_ALIGN_PARAGRAPH.JUSTIFY,
-                }
-                if alignment in align_map:
-                    para.alignment = align_map[alignment]
+        if match_text and match_text not in para.text:
+            return False
+        
+        alignment = params.get("alignment")
+        if alignment:
+            from docx.enum.text import WD_ALIGN_PARAGRAPH
+            align_map = {
+                "left": WD_ALIGN_PARAGRAPH.LEFT,
+                "center": WD_ALIGN_PARAGRAPH.CENTER,
+                "right": WD_ALIGN_PARAGRAPH.RIGHT,
+                "justify": WD_ALIGN_PARAGRAPH.JUSTIFY,
+            }
+            if alignment in align_map:
+                para.alignment = align_map[alignment]
 
-            line_spacing = params.get("line_spacing")
-            if line_spacing is not None:
-                para.paragraph_format.line_spacing = float(line_spacing)
+        line_spacing = params.get("line_spacing")
+        if line_spacing is not None:
+            para.paragraph_format.line_spacing = float(line_spacing)
 
-            page_break_before = params.get("page_break_before")
-            if page_break_before is not None:
-                para.paragraph_format.page_break_before = bool(page_break_before)
+        page_break_before = params.get("page_break_before")
+        if page_break_before is not None:
+            para.paragraph_format.page_break_before = bool(page_break_before)
 
-            space_before = params.get("space_before_pt")
-            if space_before is not None:
-                from docx.shared import Pt
-                para.paragraph_format.space_before = Pt(float(space_before))
+        space_before = params.get("space_before_pt")
+        if space_before is not None:
+            from docx.shared import Pt
+            para.paragraph_format.space_before = Pt(float(space_before))
 
-            space_after = params.get("space_after_pt")
-            if space_after is not None:
-                from docx.shared import Pt
-                para.paragraph_format.space_after = Pt(float(space_after))
-                
-            left_indent = params.get("left_indent_pt")
-            if left_indent is not None:
-                from docx.shared import Pt
-                para.paragraph_format.left_indent = Pt(float(left_indent))
-                
-            right_indent = params.get("right_indent_pt")
-            if right_indent is not None:
-                from docx.shared import Pt
-                para.paragraph_format.right_indent = Pt(float(right_indent))
-                
-            first_line_indent = params.get("first_line_indent_pt")
-            if first_line_indent is not None:
-                from docx.shared import Pt
-                para.paragraph_format.first_line_indent = Pt(float(first_line_indent))
-                
-            keep_with_next = params.get("keep_with_next")
-            if keep_with_next is not None:
-                para.paragraph_format.keep_with_next = bool(keep_with_next)
-                
-            keep_together = params.get("keep_together")
-            if keep_together is not None:
-                para.paragraph_format.keep_together = bool(keep_together)
+        space_after = params.get("space_after_pt")
+        if space_after is not None:
+            from docx.shared import Pt
+            para.paragraph_format.space_after = Pt(float(space_after))
+            
+        left_indent = params.get("left_indent_pt")
+        if left_indent is not None:
+            from docx.shared import Pt
+            para.paragraph_format.left_indent = Pt(float(left_indent))
+            
+        right_indent = params.get("right_indent_pt")
+        if right_indent is not None:
+            from docx.shared import Pt
+            para.paragraph_format.right_indent = Pt(float(right_indent))
+            
+        first_line_indent = params.get("first_line_indent_pt")
+        if first_line_indent is not None:
+            from docx.shared import Pt
+            para.paragraph_format.first_line_indent = Pt(float(first_line_indent))
+            
+        keep_with_next = params.get("keep_with_next")
+        if keep_with_next is not None:
+            para.paragraph_format.keep_with_next = bool(keep_with_next)
+            
+        keep_together = params.get("keep_together")
+        if keep_together is not None:
+            para.paragraph_format.keep_together = bool(keep_together)
 
-            include_in_toc = params.get("include_in_toc")
-            if include_in_toc is not None:
-                from docx.oxml.ns import qn as _qn
-                from docx.oxml import OxmlElement
-                pPr = para._p.get_or_add_pPr()
-                outlineLvl = pPr.find(_qn('w:outlineLvl'))
-                if include_in_toc is False:
-                    if outlineLvl is None:
-                        outlineLvl = OxmlElement('w:outlineLvl')
-                        pPr.append(outlineLvl)
-                    outlineLvl.set(_qn('w:val'), '9')
-                else:
-                    if outlineLvl is not None:
-                        pPr.remove(outlineLvl)
+        include_in_toc = params.get("include_in_toc")
+        if include_in_toc is not None:
+            from docx.oxml.ns import qn as _qn
+            from docx.oxml import OxmlElement
+            pPr = para._p.get_or_add_pPr()
+            outlineLvl = pPr.find(_qn('w:outlineLvl'))
+            if include_in_toc is False:
+                if outlineLvl is None:
+                    outlineLvl = OxmlElement('w:outlineLvl')
+                    pPr.append(outlineLvl)
+                outlineLvl.set(_qn('w:val'), '9')
+            else:
+                if outlineLvl is not None:
+                    pPr.remove(outlineLvl)
 
         # Normalise color_hex: strip '#' prefix so both "FF0000" and "#FF0000" work
         raw_color = params.get("color_hex", "")
@@ -2828,7 +2859,34 @@ class DocumentProcessor:
         if action == "create":
             rows = params.get("rows", 3)
             cols = params.get("cols", 3)
-            doc.add_table(rows=rows, cols=cols)
+            tbl = doc.add_table(rows=rows, cols=cols)
+            
+            before_id = params.get("before_id")
+            after_id = params.get("after_id")
+            if before_id or after_id:
+                body_index = self._build_docx_body_index(doc)
+                id_to_pos = {eid: i for i, (eid, _) in enumerate(body_index)}
+                
+                target_xml_el = None
+                insert_before = True
+                if before_id:
+                    pos = id_to_pos.get(before_id, -1)
+                    if pos != -1:
+                        target_xml_el = body_index[pos][1]
+                elif after_id:
+                    pos = id_to_pos.get(after_id, -1)
+                    if pos != -1:
+                        target_xml_el = body_index[pos][1]
+                        insert_before = False
+                        
+                if target_xml_el is not None:
+                    tbl_xml = tbl._tbl
+                    tbl_xml.getparent().remove(tbl_xml)
+                    if insert_before:
+                        target_xml_el.addprevious(tbl_xml)
+                    else:
+                        target_xml_el.addnext(tbl_xml)
+
             return f"Created {rows}x{cols} table"
             
         is_all = tgt.get("type") == "all"
@@ -2954,6 +3012,8 @@ class DocumentProcessor:
 
             elif action == "set_width_pct":
                 width_pct = float(params.get("width_pct", 1.0))
+                if width_pct > 1.0:
+                    width_pct = width_pct / 100.0  # Handle cases where LLM passes 100 instead of 1.0
                 try:
                     section = doc.sections[0]
                     usable_width = section.page_width - section.left_margin - section.right_margin
@@ -2972,15 +3032,21 @@ class DocumentProcessor:
                 summaries.append(f"Set width of table {t_idx} to {int(width_pct*100)}%")
 
             elif action in ["set_cell_bg", "alternate_rows", "set_header_format", "apply_theme"]:
-                # For simplicity, we implement some basic iteration
-                from docx.oxml.ns import nsdecls
+                # Helper to safely set background color without duplicating w:shd
+                from docx.oxml.ns import nsdecls, qn
                 from docx.oxml import parse_xml
+                def _set_cell_bg(cell, clr):
+                    tcPr = cell._tc.get_or_add_tcPr()
+                    for existing_shd in tcPr.findall(qn('w:shd')):
+                        tcPr.remove(existing_shd)
+                    shading_elm = parse_xml(r'<w:shd {} w:fill="{}"/>'.format(nsdecls('w'), clr))
+                    tcPr.append(shading_elm)
+
                 if action == "set_header_format":
                     if len(tbl.rows) > 0:
                         from docx.shared import RGBColor as DRGBColor
                         for cell in tbl.rows[0].cells:
-                            shading_elm = parse_xml(r'<w:shd {} w:fill="{}"/>'.format(nsdecls('w'), "000080")) # dark blue
-                            cell._tc.get_or_add_tcPr().append(shading_elm)
+                            _set_cell_bg(cell, "000080") # dark blue
                             for para in cell.paragraphs:
                                 for run in para.runs:
                                     run.font.bold = True
@@ -2988,39 +3054,83 @@ class DocumentProcessor:
                         summaries.append(f"Formatted header for table {t_idx}")
                         continue
                 
+                if action == "set_cell_bg":
+                    row_idx = params.get("row_index")
+                    col_idx = params.get("col_index")
+                    color = str(params.get("cell_bg_hex", "")).strip().lstrip("#").upper()
+                    if color:
+                        if row_idx is not None and col_idx is not None:
+                            if 0 <= row_idx < len(tbl.rows) and 0 <= col_idx < len(tbl.rows[row_idx].cells):
+                                _set_cell_bg(tbl.cell(row_idx, col_idx), color)
+                        elif row_idx is not None:
+                            if 0 <= row_idx < len(tbl.rows):
+                                for c in tbl.rows[row_idx].cells:
+                                    _set_cell_bg(c, color)
+                        elif col_idx is not None:
+                            for r in tbl.rows:
+                                if 0 <= col_idx < len(r.cells):
+                                    _set_cell_bg(r.cells[col_idx], color)
+                    summaries.append(f"Set cell background for table {t_idx}")
+                    continue
+
                 if action == "alternate_rows":
                     colors = params.get("alternate_row_colors", ["FFFFFF", "F2F2F2"])
                     if len(colors) == 2:
                         for i, row in enumerate(tbl.rows):
                             color = colors[i % 2].lstrip("#")
                             for cell in row.cells:
-                                shading_elm = parse_xml(r'<w:shd {} w:fill="{}"/>'.format(nsdecls('w'), color))
-                                cell._tc.get_or_add_tcPr().append(shading_elm)
+                                _set_cell_bg(cell, color)
                         summaries.append(f"Applied alternate row colors to table {t_idx}")
                         continue
-                
+
                 if action == "apply_theme":
-                    theme_color = str(params.get("theme_color_hex", "ADD8E6")).strip().lstrip("#")
-                    # Header gets theme color
-                    for cell in tbl.rows[0].cells:
-                        shading_elm = parse_xml(r'<w:shd {} w:fill="{}"/>'.format(nsdecls('w'), theme_color))
-                        cell._tc.get_or_add_tcPr().append(shading_elm)
-                    # Alternate remaining rows with white and very light version (e.g. F2F2F2)
-                    for i, row in enumerate(tbl.rows[1:]):
-                        color = "FFFFFF" if i % 2 == 0 else "F9F9F9"
-                        for cell in row.cells:
-                            shading_elm = parse_xml(r'<w:shd {} w:fill="{}"/>'.format(nsdecls('w'), color))
-                            cell._tc.get_or_add_tcPr().append(shading_elm)
+                    theme_color = params.get("theme_color_hex", "4F81BD").lstrip("#").upper()
+                    if len(tbl.rows) > 0:
+                        for cell in tbl.rows[0].cells:
+                            _set_cell_bg(cell, theme_color)
+                            for para in cell.paragraphs:
+                                for run in para.runs:
+                                    run.font.bold = True
+                                    try:
+                                        from docx.shared import RGBColor as DRGBColor
+                                        run.font.color.rgb = DRGBColor(255, 255, 255)
+                                    except Exception:
+                                        pass
+                    if len(tbl.rows) > 1:
+                        for i, row in enumerate(tbl.rows[1:]):
+                            color = "FFFFFF" if i % 2 == 0 else "F9F9F9"
+                            for cell in row.cells:
+                                _set_cell_bg(cell, color)
                     summaries.append(f"Applied theme #{theme_color} to table {t_idx}")
                     continue
 
             elif action == "sort_data":
-                # Very basic sort implementation for demonstration
                 if len(tbl.rows) > 1:
+                    # Find sort column. Default is 0. If user provided col_index, use it.
+                    sort_col_idx = params.get("col_index")
+                    if sort_col_idx is None:
+                        # If the user passed sort_by_column in the params even if it's not strictly in schema
+                        sort_by_name = str(params.get("sort_by_column", "")).lower()
+                        sort_col_idx = 0
+                        if sort_by_name:
+                            for c_i, c in enumerate(tbl.rows[0].cells):
+                                if c.text.strip().lower() == sort_by_name:
+                                    sort_col_idx = c_i
+                                    break
+
                     header = [c.text for c in tbl.rows[0].cells]
                     data = [[c.text for c in r.cells] for r in tbl.rows[1:]]
                     try:
-                        data.sort(key=lambda x: x[0]) # default sort by first col
+                        # Sort by the chosen column, handling numeric vs string
+                        def _sort_key(x):
+                            val = x[sort_col_idx] if 0 <= sort_col_idx < len(x) else ""
+                            try:
+                                # Strip currency/percent for sorting
+                                clean = val.replace("$", "").replace("%", "").replace(",", "")
+                                return (0, float(clean))
+                            except ValueError:
+                                return (1, val)
+                        data.sort(key=_sort_key)
                         for i, row_data in enumerate(data):
                             for j, val in enumerate(row_data):
                                 tbl.rows[i+1].cells[j].text = val
@@ -3034,6 +3144,8 @@ class DocumentProcessor:
 
             elif action == "set_cell_alignment":
                 alignment = params.get("cell_alignment")
+                row_idx = params.get("row_index")
+                col_idx = params.get("col_index")
                 if alignment:
                     from docx.enum.text import WD_ALIGN_PARAGRAPH
                     align_map = {
@@ -3043,26 +3155,28 @@ class DocumentProcessor:
                         "justify": WD_ALIGN_PARAGRAPH.JUSTIFY,
                     }
                     if alignment in align_map:
-                        for row in tbl.rows:
-                            for cell in row.cells:
-                                for p in cell.paragraphs:
-                                    p.alignment = align_map[alignment]
+                        def _set_align(cell):
+                            for p in cell.paragraphs:
+                                p.alignment = align_map[alignment]
+
+                        if row_idx is not None and col_idx is not None:
+                            if 0 <= row_idx < len(tbl.rows) and 0 <= col_idx < len(tbl.rows[row_idx].cells):
+                                _set_align(tbl.cell(row_idx, col_idx))
+                        elif row_idx is not None:
+                            if 0 <= row_idx < len(tbl.rows):
+                                for c in tbl.rows[row_idx].cells:
+                                    _set_align(c)
+                        elif col_idx is not None:
+                            for r in tbl.rows:
+                                if 0 <= col_idx < len(r.cells):
+                                    _set_align(r.cells[col_idx])
+                        else:
+                            for row in tbl.rows:
+                                for cell in row.cells:
+                                    _set_align(cell)
                     summaries.append(f"Aligned text in table {t_idx} to {alignment}")
 
             # --- Universal Table Modifiers ---
-            cell_bg = params.get("cell_bg_hex")
-            if cell_bg:
-                color = str(cell_bg).lstrip("#").upper()
-                for row in tbl.rows:
-                    for cell in row.cells:
-                        from docx.oxml.shared import OxmlElement, qn
-                        tcPr = cell._tc.get_or_add_tcPr()
-                        shd = OxmlElement("w:shd")
-                        shd.set(qn("w:val"), "clear")
-                        shd.set(qn("w:color"), "auto")
-                        shd.set(qn("w:fill"), color)
-                        tcPr.append(shd)
-                summaries.append(f"Set cell background to {color} for table {t_idx}")
 
             valign = params.get("cell_vertical_alignment")
             if valign:

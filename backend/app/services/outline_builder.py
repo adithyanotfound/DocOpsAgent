@@ -69,9 +69,10 @@ class OutlineBuilder:
             if not el_id:
                 continue
             
-            last_id = el_id
-            if first_id is None:
-                first_id = el_id
+            if el_type not in ("metadata", "section"):
+                last_id = el_id
+                if first_id is None:
+                    first_id = el_id
 
             el_summary = {
                 "id": el_id,
@@ -175,14 +176,29 @@ class OutlineBuilder:
                 if cell_bgs:
                     t_styles.append(f"cell_bgs:{','.join(list(cell_bgs))}")
                 
-                # Check for cell vertical alignments
+                # Check for cell vertical alignments and paragraph alignments
                 valigns = set()
+                aligns = set()
+                table_text = []
                 for row in el.get("rows", []):
                     for cell in row.get("cells", []):
                         if cell.get("vertical_alignment"):
                             valigns.add(cell["vertical_alignment"])
+                        for child in cell.get("children", []):
+                            if child.get("text"):
+                                table_text.append(child["text"])
+                            c_style = child.get("style", {})
+                            if c_style and c_style.get("alignment"):
+                                aligns.add(c_style["alignment"])
                 if valigns:
                     t_styles.append(f"valign:{','.join(sorted(valigns))}")
+                if aligns:
+                    t_styles.append(f"align:{','.join(sorted(aligns))}")
+
+                if table_text:
+                    full_text = " | ".join(table_text)
+                    el_summary["text_preview"] = full_text[:120]
+                    el_summary["text_length"] = len(full_text)
 
                 if t_styles:
                     el_summary["style_summary"] = t_styles
@@ -199,6 +215,14 @@ class OutlineBuilder:
                 el_summary["size"] = f"{w_cm}cm x {h_cm}cm"
                 el_summary["alt_text"] = el.get("description", "")
                 indices["images_by_ordinal"][str(image_counter)] = el_id
+            elif el_type == "section":
+                el_summary["role"] = "section"
+                if el.get("style"):
+                    el_summary["style_summary"] = [f"{k}:{v}" for k, v in el["style"].items()]
+            elif el_type == "metadata":
+                el_summary["role"] = "metadata"
+                if el.get("properties"):
+                    el_summary["style_summary"] = [f"{k}:{v}" for k, v in el["properties"].items()]
             
             flat_elements.append(el_summary)
 
