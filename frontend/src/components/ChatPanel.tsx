@@ -14,6 +14,7 @@ import { FormEvent, useEffect, useRef, useState } from "react";
 import { rollback, startChat, pollRun } from "../api";
 import { useAppStore } from "../store";
 import type { AgentContent, Workspace } from "../types";
+import { KnowledgePanel } from "./KnowledgePanel";
 
 type Props = {
   workspace: Workspace;
@@ -202,6 +203,9 @@ export function ChatPanel({ workspace }: Props) {
           )}
         </div>
       </div>
+
+      {/* Knowledge Base Panel */}
+      <KnowledgePanel workspaceId={workspace.id} />
 
       {/* Message list */}
       <div className="min-h-0 flex-1 overflow-y-auto px-5 py-4">

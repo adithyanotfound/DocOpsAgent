@@ -15,3 +15,5 @@ openai>=1.35.0
 qdrant-client>=1.10.0
 langgraph>=0.2.0
 langchain-core>=0.3.0
+# Knowledge base document parsing
+PyPDF2>=3.0.0

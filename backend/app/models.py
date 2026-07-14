@@ -33,6 +33,7 @@ class Workspace(Base):
 
     messages: Mapped[list["Message"]] = relationship(cascade="all, delete-orphan")
     versions: Mapped[list["DocumentVersion"]] = relationship(cascade="all, delete-orphan")
+    knowledge_documents: Mapped[list["KnowledgeDocument"]] = relationship(cascade="all, delete-orphan")
 
 
 class Message(Base):
@@ -73,3 +74,43 @@ class DocumentStructure(Base):
     workspace_id: Mapped[str] = mapped_column(String, ForeignKey("workspaces.id"), index=True)
     version_number: Mapped[int] = mapped_column(Integer)
     structure_json: Mapped[dict] = mapped_column(JSON)
+
+
+# ---------------------------------------------------------------------------
+# Knowledge Base Models
+# ---------------------------------------------------------------------------
+
+KB_MAX_DOCUMENTS_PER_WORKSPACE = 50
+KB_MAX_FILE_SIZE_BYTES = 50 * 1024 * 1024   # 50 MB per file
+KB_MAX_TOTAL_BYTES_PER_WORKSPACE = 100 * 1024 * 1024  # 100 MB total
+
+
+class KnowledgeDocument(Base):
+    """A document uploaded to a workspace's knowledge base."""
+    __tablename__ = "knowledge_documents"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=new_id)
+    workspace_id: Mapped[str] = mapped_column(String, ForeignKey("workspaces.id"), index=True)
+    filename: Mapped[str] = mapped_column(String)
+    file_type: Mapped[str] = mapped_column(String(10))   # "pdf", "docx", "txt", "md"
+    file_path: Mapped[str] = mapped_column(String)
+    file_size_bytes: Mapped[int] = mapped_column(Integer, default=0)
+    chunk_count: Mapped[int] = mapped_column(Integer, default=0)
+    status: Mapped[str] = mapped_column(String(20), default="processing")  # processing|indexed|failed
+    error_message: Mapped[str] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    chunks: Mapped[list["KnowledgeChunk"]] = relationship(cascade="all, delete-orphan")
+
+
+class KnowledgeChunk(Base):
+    """A text chunk from a knowledge document, indexed for retrieval."""
+    __tablename__ = "knowledge_chunks"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=new_id)
+    document_id: Mapped[str] = mapped_column(String, ForeignKey("knowledge_documents.id"), index=True)
+    workspace_id: Mapped[str] = mapped_column(String, ForeignKey("workspaces.id"), index=True)
+    chunk_index: Mapped[int] = mapped_column(Integer)
+    text: Mapped[str] = mapped_column(Text)
+    chunk_metadata: Mapped[dict] = mapped_column(JSON, default=dict)  # page, section, source info
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)

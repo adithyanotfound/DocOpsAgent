@@ -28,3 +28,108 @@ textarea {
 canvas {
   max-width: 100%;
 }
+
+/* Knowledge Base Panel Styles */
+.kb-panel {
+  @apply flex flex-col border-b-2 border-ink bg-paper;
+}
+.kb-panel-header {
+  @apply flex items-center justify-between px-5 py-3 border-b-2 border-ink bg-accent/20 cursor-pointer hover:bg-accent/40 transition-colors;
+}
+.kb-panel-title {
+  @apply flex items-center gap-2 font-bold text-sm;
+}
+.kb-doc-count {
+  @apply text-xs font-semibold px-2 py-0.5 bg-ink text-paper rounded-full;
+}
+.kb-panel-content {
+  @apply p-4 max-h-[300px] overflow-y-auto;
+}
+
+/* Dropzone */
+.kb-dropzone {
+  @apply border-2 border-dashed border-ink/40 rounded-lg p-6 flex flex-col items-center justify-center cursor-pointer transition-colors hover:border-ink hover:bg-accent/10 mb-4 text-center;
+}
+.kb-dropzone-active {
+  @apply border-ink bg-accent/20;
+}
+.kb-upload-icon {
+  @apply mb-2 text-ink/60;
+}
+.kb-dropzone-title {
+  @apply text-sm font-bold;
+}
+.kb-dropzone-hint {
+  @apply text-xs text-ink/60 mt-1;
+}
+
+/* Error */
+.kb-error {
+  @apply flex items-center gap-2 text-xs font-bold text-red-600 bg-red-50 p-3 rounded-lg border-2 border-red-200 mb-4;
+}
+
+/* Doc List */
+.kb-doc-list {
+  @apply flex flex-col gap-2;
+}
+.kb-doc-item {
+  @apply flex items-center gap-3 p-3 border-2 border-ink/20 rounded-lg bg-paper hover:border-ink transition-colors relative;
+}
+.kb-doc-icon {
+  @apply text-xl;
+}
+.kb-doc-info {
+  @apply flex flex-col min-w-0 flex-1;
+}
+.kb-doc-name {
+  @apply text-sm font-bold truncate;
+}
+.kb-doc-meta {
+  @apply flex items-center gap-2 mt-1 text-[11px] font-medium text-ink/60;
+}
+.kb-doc-size, .kb-doc-chunks {
+  @apply px-1.5 py-0.5 bg-ink/5 rounded;
+}
+.kb-doc-error {
+  @apply text-[11px] font-bold text-red-600 mt-1 line-clamp-1;
+}
+.kb-doc-delete {
+  @apply p-1.5 text-ink/40 hover:text-red-600 hover:bg-red-50 rounded transition-colors opacity-0 group-hover:opacity-100 focus:opacity-100;
+}
+
+/* Empty State */
+.kb-empty {
+  @apply flex flex-col items-center justify-center p-6 text-center border-2 border-dashed border-ink/20 rounded-lg bg-paper/50;
+}
+.kb-empty-icon {
+  @apply text-ink/20 mb-3;
+}
+.kb-empty-title {
+  @apply text-sm font-bold text-ink/60;
+}
+.kb-empty-hint {
+  @apply text-xs text-ink/40 mt-1 max-w-[200px];
+}
+
+/* Loading */
+.kb-loading {
+  @apply flex items-center justify-center gap-2 p-6 text-xs font-bold text-ink/60;
+}
+
+/* Status Badges */
+.kb-status-badge {
+  @apply flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-bold uppercase tracking-wider;
+}
+.kb-status-processing {
+  @apply bg-blue-100 text-blue-700;
+}
+.kb-status-indexed {
+  @apply bg-green-100 text-green-700;
+}
+.kb-status-failed {
+  @apply bg-red-100 text-red-700;
+}
+
+.kb-footer-hint {
+  @apply text-[11px] font-medium text-ink/40 text-center mt-4;
+}

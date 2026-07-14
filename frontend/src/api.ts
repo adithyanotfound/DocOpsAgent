@@ -1,4 +1,4 @@
-import type { Workspace } from "./types";
+import type { KnowledgeDocument, Workspace } from "./types";
 
 export const API_BASE = "";
 
@@ -80,4 +80,51 @@ export async function rollback(workspaceId: string, version: number): Promise<Wo
 
 export function fileUrl(path: string): string {
   return path;
+}
+
+// ---------------------------------------------------------------------------
+// Knowledge Base API
+// ---------------------------------------------------------------------------
+
+export async function listKnowledgeDocuments(workspaceId: string): Promise<KnowledgeDocument[]> {
+  return parse<KnowledgeDocument[]>(
+    await fetch(`${API_BASE}/api/workspaces/${workspaceId}/knowledge`)
+  );
+}
+
+export async function uploadKnowledgeDocument(
+  workspaceId: string,
+  file: File
+): Promise<KnowledgeDocument> {
+  const form = new FormData();
+  form.append("file", file);
+  return parse<KnowledgeDocument>(
+    await fetch(`${API_BASE}/api/workspaces/${workspaceId}/knowledge`, {
+      method: "POST",
+      body: form,
+    })
+  );
+}
+
+export async function deleteKnowledgeDocument(
+  workspaceId: string,
+  docId: string
+): Promise<void> {
+  const response = await fetch(
+    `${API_BASE}/api/workspaces/${workspaceId}/knowledge/${docId}`,
+    { method: "DELETE" }
+  );
+  if (!response.ok) {
+    const body = await response.json().catch(() => ({ detail: response.statusText }));
+    throw new Error(body.detail ?? "Delete failed");
+  }
+}
+
+export async function getKnowledgeDocumentStatus(
+  workspaceId: string,
+  docId: string
+): Promise<{ id: string; status: string; chunk_count: number; error_message?: string }> {
+  return parse(
+    await fetch(`${API_BASE}/api/workspaces/${workspaceId}/knowledge/${docId}/status`)
+  );
 }

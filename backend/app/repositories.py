@@ -1,8 +1,11 @@
 from typing import List
-from sqlalchemy import select
+from sqlalchemy import select, func
 from sqlalchemy.orm import Session
 
-from app.models import DocumentStructure, DocumentVersion, Message, Workspace
+from app.models import (
+    DocumentStructure, DocumentVersion, KnowledgeDocument,
+    KnowledgeChunk, Message, Workspace,
+)
 
 
 class WorkspaceRepository:
@@ -46,5 +49,41 @@ class WorkspaceRepository:
             select(DocumentVersion)
             .where(DocumentVersion.workspace_id == workspace_id)
             .order_by(DocumentVersion.version_number.asc())
+        )
+        return list(self.db.scalars(stmt))
+
+    # ── Knowledge Base ──────────────────────────────────────────────────────
+
+    def list_knowledge_documents(self, workspace_id: str) -> List[KnowledgeDocument]:
+        stmt = (
+            select(KnowledgeDocument)
+            .where(KnowledgeDocument.workspace_id == workspace_id)
+            .order_by(KnowledgeDocument.created_at.asc())
+        )
+        return list(self.db.scalars(stmt))
+
+    def get_knowledge_document(self, document_id: str) -> KnowledgeDocument | None:
+        return self.db.get(KnowledgeDocument, document_id)
+
+    def count_knowledge_documents(self, workspace_id: str) -> int:
+        stmt = (
+            select(func.count())
+            .select_from(KnowledgeDocument)
+            .where(KnowledgeDocument.workspace_id == workspace_id)
+        )
+        return self.db.scalar(stmt) or 0
+
+    def total_knowledge_size_bytes(self, workspace_id: str) -> int:
+        stmt = (
+            select(func.sum(KnowledgeDocument.file_size_bytes))
+            .where(KnowledgeDocument.workspace_id == workspace_id)
+        )
+        return self.db.scalar(stmt) or 0
+
+    def list_knowledge_chunks(self, workspace_id: str) -> List[KnowledgeChunk]:
+        stmt = (
+            select(KnowledgeChunk)
+            .where(KnowledgeChunk.workspace_id == workspace_id)
+            .order_by(KnowledgeChunk.document_id, KnowledgeChunk.chunk_index)
         )
         return list(self.db.scalars(stmt))

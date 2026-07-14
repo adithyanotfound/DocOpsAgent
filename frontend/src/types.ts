@@ -24,6 +24,17 @@ export type Version = {
   created_at: string;
 };
 
+export type KnowledgeDocument = {
+  id: string;
+  filename: string;
+  file_type: string;
+  file_size_bytes: number;
+  chunk_count: number;
+  status: "processing" | "indexed" | "failed";
+  error_message?: string | null;
+  created_at: string;
+};
+
 export type Workspace = {
   id: string;
   document_type: "pptx" | "docx";
@@ -33,6 +44,7 @@ export type Workspace = {
   updated_at: string;
   messages: Message[];
   versions: Version[];
+  knowledge_documents: KnowledgeDocument[];
 };
 
 export type SocketEvent =

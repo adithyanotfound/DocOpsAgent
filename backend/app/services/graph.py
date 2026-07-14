@@ -45,6 +45,11 @@ from app.services.storage import StorageService
 from app.services.outline_builder import OutlineBuilder
 from app.services.context_fetcher import ContextFetcher
 from app.services.run_store import run_store
+from app.services.template_analyzer import TemplateAnalyzer
+from app.services.document_planner import DocumentPlanner
+from app.services.section_generator import SectionGenerator
+from app.services.document_assembler import DocumentAssembler
+from app.services.kb_retrieval import KBRetrievalService
 
 MAX_ITERATIONS = 4
 
@@ -100,6 +105,12 @@ class AgentState(TypedDict):
     thoughts: list[str]
     satisfied: bool
 
+    # DOCX generation mode fields
+    template_analysis: dict
+    kb_context: list[dict]
+    document_plan: dict
+    generated_sections: list[dict]
+
 
 # ---------------------------------------------------------------------------
 # Graph Class
@@ -129,6 +140,14 @@ class DocumentAgentGraph:
         self.content_enricher = ContentEnricher(llm=self.llm)
         self.storage = StorageService()
         self.preview = PreviewService()
+
+        # DOCX generation services
+        self.template_analyzer = TemplateAnalyzer()
+        self.doc_planner = DocumentPlanner(llm=self.llm)
+        self.section_generator = SectionGenerator(llm=self.llm)
+        self.doc_assembler = DocumentAssembler()
+        self.kb_retrieval = KBRetrievalService()
+
         self._graph = self._build()
 
     # ------------------------------------------------------------------
@@ -156,6 +175,13 @@ class DocumentAgentGraph:
         workflow.add_node("review_plan",                self._review_plan)
         workflow.add_node("apply_slide_plan",           self._apply_slide_plan)
 
+        # DOCX generation pipeline nodes
+        workflow.add_node("analyze_template",           self._analyze_template)
+        workflow.add_node("retrieve_kb_context",        self._retrieve_kb_context)
+        workflow.add_node("plan_document",              self._plan_document)
+        workflow.add_node("generate_sections",          self._generate_sections)
+        workflow.add_node("assemble_document",          self._assemble_document)
+
         # Topology Flow
         workflow.set_entry_point("read_document")
         workflow.add_edge("read_document", "build_outline")
@@ -168,6 +194,7 @@ class DocumentAgentGraph:
             self._route_planning,
             {
                 "generate": "plan_slides",
+                "docx_generate": "analyze_template",
                 "operations": "resolve_task_references",
                 "finalize": "finalize_operations",
             }
@@ -184,6 +211,13 @@ class DocumentAgentGraph:
             }
         )
         workflow.add_edge("apply_slide_plan", END)
+
+        # DOCX generation sub-graph
+        workflow.add_edge("analyze_template", "retrieve_kb_context")
+        workflow.add_edge("retrieve_kb_context", "plan_document")
+        workflow.add_edge("plan_document", "generate_sections")
+        workflow.add_edge("generate_sections", "assemble_document")
+        workflow.add_edge("assemble_document", "finalize_operations")
 
         # Operations staged loop sub-graph
         workflow.add_edge("resolve_task_references", "fetch_task_context")
@@ -299,6 +333,12 @@ class DocumentAgentGraph:
             "new_version_number": None,
             "thoughts": [],
             "satisfied": False,
+
+            # DOCX generation fields
+            "template_analysis": {},
+            "kb_context": [],
+            "document_plan": {},
+            "generated_sections": [],
         }
 
         try:
@@ -393,9 +433,16 @@ class DocumentAgentGraph:
             relevant_blocks=context_blocks
         )
         
-        # Route to generate mode if there's a generate task
+        # Route to appropriate mode based on document type and task type
         has_generate = any(t["task_type"] == "generate" for t in tasks)
-        mode = "generate" if (has_generate and state["document_type"] == "pptx") else "operations"
+        has_docx_generate = any(t["task_type"] == "docx_generate" for t in tasks)
+
+        if has_docx_generate and state["document_type"] == "docx":
+            mode = "docx_generate"
+        elif has_generate and state["document_type"] == "pptx":
+            mode = "generate"
+        else:
+            mode = "operations"
 
         # Log plan summary
         planned_tasks = "\n".join(f"  - {t['description']} (target: {t['target_hint']})" for t in tasks)
@@ -613,7 +660,8 @@ class DocumentAgentGraph:
         document_path = self.storage.version_document_path(state["workspace_id"], new_version, state["document_type"])
         
         import shutil
-        shutil.copy2(state["source_document_path"], document_path)
+        if str(state["source_document_path"]) != str(document_path):
+            shutil.copy2(state["source_document_path"], document_path)
         
         pdf_path = self.storage.version_pdf_path(state["workspace_id"], new_version)
         await self.preview.convert_to_pdf(document_path, pdf_path)
@@ -757,9 +805,12 @@ class DocumentAgentGraph:
     # ------------------------------------------------------------------
 
     def _route_planning(self, state: AgentState) -> str:
-        if not state.get("tasks") and state.get("mode") == "operations":
+        mode = state.get("mode", "operations")
+        if not state.get("tasks") and mode == "operations":
             return "finalize"
-        return state["mode"]
+        if mode == "docx_generate":
+            return "docx_generate"
+        return mode
 
     def _decide_loop(self, state: AgentState) -> str:
         if state["needs_image"]:
@@ -781,6 +832,122 @@ class DocumentAgentGraph:
         if state["iteration"] > MAX_ITERATIONS:
             return "commit"
         return "refine"
+
+    # ------------------------------------------------------------------
+    # DOCX Generation Nodes
+    # ------------------------------------------------------------------
+
+    async def _analyze_template(self, state: AgentState) -> dict:
+        thought = "Analyzing template structure, styles, and formatting..."
+        await self._thought(state, thought)
+        template_path = Path(state["source_document_path"])
+        analysis = self.template_analyzer.analyze(template_path)
+        section_names = [s.get("heading_text", "") for s in analysis.get("sections", [])]
+        thought2 = f"Template has {len(section_names)} top-level section(s): {', '.join(section_names[:5])}"
+        await self._thought(state, thought2)
+        return {
+            "template_analysis": analysis,
+            "thoughts": state["thoughts"] + [thought, thought2],
+        }
+
+    async def _retrieve_kb_context(self, state: AgentState) -> dict:
+        thought = "Searching knowledge base for relevant content..."
+        await self._thought(state, thought)
+
+        # Fetch all KB chunks for this workspace from DB
+        kb_chunks_db = self.repo.list_knowledge_chunks(state["workspace_id"])
+        chunks_as_dicts = [
+            {
+                "text": c.text,
+                "chunk_index": c.chunk_index,
+                "metadata": {**(c.chunk_metadata or {}), "doc_id": c.document_id},
+            }
+            for c in kb_chunks_db
+        ]
+
+        if not chunks_as_dicts:
+            thought2 = "No knowledge base documents found — will use general knowledge."
+            await self._thought(state, thought2)
+            return {"kb_context": [], "thoughts": state["thoughts"] + [thought, thought2]}
+
+        # Retrieve most relevant chunks via vector/keyword search
+        relevant = self.kb_retrieval.retrieve(
+            workspace_id=state["workspace_id"],
+            query=state["request"],
+            chunks_from_db=chunks_as_dicts,
+            limit=20,
+        )
+
+        thought2 = f"Retrieved {len(relevant)} relevant KB chunk(s) from {len(chunks_as_dicts)} total."
+        await self._thought(state, thought2)
+        return {
+            "kb_context": relevant,
+            "thoughts": state["thoughts"] + [thought, thought2],
+        }
+
+    async def _plan_document(self, state: AgentState) -> dict:
+        thought = "Planning document structure section by section..."
+        await self._thought(state, thought)
+
+        plan = self.doc_planner.plan(
+            user_request=state["original_request"],
+            template_analysis=state["template_analysis"],
+            kb_context=state["kb_context"],
+            chat_history=state["chat_history"],
+        )
+
+        n_sections = len(plan.get("sections", []))
+        thought2 = f"Document plan created with {n_sections} section(s)."
+        await self._thought(state, thought2)
+        return {
+            "document_plan": plan,
+            "thoughts": state["thoughts"] + [thought, thought2],
+        }
+
+    async def _generate_sections(self, state: AgentState) -> dict:
+        thought = "Generating content for each section (grounded in knowledge base)..."
+        await self._thought(state, thought)
+
+        sections = self.section_generator.generate_all_sections(
+            document_plan=state["document_plan"],
+            kb_context=state["kb_context"],
+            template_analysis=state["template_analysis"],
+        )
+
+        thought2 = f"Generated content for {len(sections)} section(s)."
+        await self._thought(state, thought2)
+        return {
+            "generated_sections": sections,
+            "thoughts": state["thoughts"] + [thought, thought2],
+        }
+
+    async def _assemble_document(self, state: AgentState) -> dict:
+        thought = "Assembling the final document with template formatting..."
+        await self._thought(state, thought)
+
+        new_version = state["latest_version_number"] + 1
+        document_path = self.storage.version_document_path(
+            state["workspace_id"], new_version, state["document_type"]
+        )
+
+        success, summaries = self.doc_assembler.assemble(
+            template_path=Path(self.storage.version_document_path(
+                state["workspace_id"], state["current_version"], state["document_type"]
+            )),
+            target_path=document_path,
+            generated_sections=state["generated_sections"],
+            template_analysis=state["template_analysis"],
+        )
+
+        thought2 = f"Document assembled: {len(summaries)} sections written."
+        await self._thought(state, thought2)
+
+        # Update source_document_path so finalize_operations picks it up
+        return {
+            "source_document_path": str(document_path),
+            "op_summaries": summaries,
+            "thoughts": state["thoughts"] + [thought, thought2],
+        }
 
     # ------------------------------------------------------------------
     # Thoughts Helpers
@@ -814,7 +981,17 @@ class DocumentAgentGraph:
             run_store.complete(state["run_id"], workspace=None)
             return
 
-        if mode == "operations":
+        if mode == "docx_generate":
+            summaries = state.get("op_summaries", [])
+            n_sections = len(state.get("generated_sections", []))
+            if not version_num:
+                summary_text = "I wasn't able to generate the document. Please try again."
+            else:
+                summary_text = (
+                    f"Generated a complete document with {n_sections} section(s) "
+                    f"grounded in your knowledge base and matching the template formatting."
+                )
+        elif mode == "operations":
             summaries = state.get("op_summaries", [])
             if not summaries or not version_num:
                 summary_text = "I wasn't able to apply any changes. Please try rephrasing your request."

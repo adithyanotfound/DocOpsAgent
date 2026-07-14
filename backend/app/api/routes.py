@@ -7,8 +7,9 @@ from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 
 from app.db.session import get_db
+from app.models import KnowledgeDocument, KnowledgeChunk, KB_MAX_DOCUMENTS_PER_WORKSPACE, KB_MAX_FILE_SIZE_BYTES, KB_MAX_TOTAL_BYTES_PER_WORKSPACE
 from app.repositories import WorkspaceRepository
-from app.schemas import WorkspaceOut
+from app.schemas import KnowledgeDocumentOut, WorkspaceOut
 from app.services.agent import DocumentAgent
 from app.services.run_store import run_store
 from app.services.serializers import serialize_workspace
@@ -73,6 +74,7 @@ def rollback(workspace_id: str, version_number: int, db: Session = Depends(get_d
 def delete_workspace(workspace_id: str, db: Session = Depends(get_db)) -> None:
     from app.core.config import settings
     from app.services.retrieval import RetrievalService
+    from app.services.kb_retrieval import KBRetrievalService
 
     repo = WorkspaceRepository(db)
     workspace = repo.get(workspace_id)
@@ -82,6 +84,7 @@ def delete_workspace(workspace_id: str, db: Session = Depends(get_db)) -> None:
     db.delete(workspace)
     db.commit()
     RetrievalService().delete_workspace(workspace_id)
+    KBRetrievalService().delete_workspace_kb(workspace_id)
 
     workspace_dir = settings.storage_root / workspace_id
     if workspace_dir.exists():
@@ -214,3 +217,233 @@ def poll_run(run_id: str) -> dict:
       }
     """
     return run_store.snapshot(run_id)
+
+
+# ---------------------------------------------------------------------------
+# Knowledge Base
+# ---------------------------------------------------------------------------
+
+_KB_ALLOWED_TYPES = {".pdf", ".docx", ".txt", ".md"}
+
+
+@router.get("/workspaces/{workspace_id}/knowledge", response_model=list[KnowledgeDocumentOut])
+def list_knowledge_documents(workspace_id: str, db: Session = Depends(get_db)) -> list[KnowledgeDocumentOut]:
+    """List all knowledge base documents for a workspace."""
+    repo = WorkspaceRepository(db)
+    if not repo.get(workspace_id):
+        raise HTTPException(status_code=404, detail="Workspace not found")
+    docs = repo.list_knowledge_documents(workspace_id)
+    return [
+        KnowledgeDocumentOut(
+            id=d.id,
+            filename=d.filename,
+            file_type=d.file_type,
+            file_size_bytes=d.file_size_bytes,
+            chunk_count=d.chunk_count,
+            status=d.status,
+            error_message=d.error_message,
+            created_at=d.created_at,
+        )
+        for d in docs
+    ]
+
+
+def _process_kb_document_bg(
+    doc_id: str,
+    file_path: str,
+    file_type: str,
+    workspace_id: str,
+    db_session_factory,
+) -> None:
+    """Background task: parse, chunk, and index a KB document."""
+    from app.db.session import SessionLocal
+    from app.services.kb_processor import KBProcessor
+    from app.services.kb_retrieval import KBRetrievalService
+
+    db = SessionLocal()
+    try:
+        doc = db.get(KnowledgeDocument, doc_id)
+        if not doc:
+            return
+
+        processor = KBProcessor()
+        chunks = processor.process_document(Path(file_path), file_type)
+
+        # Store chunks in DB
+        for chunk in chunks:
+            db_chunk = KnowledgeChunk(
+                document_id=doc_id,
+                workspace_id=workspace_id,
+                chunk_index=chunk["chunk_index"],
+                text=chunk["text"],
+                chunk_metadata=chunk.get("metadata", {}),
+            )
+            db.add(db_chunk)
+
+        doc.chunk_count = len(chunks)
+        doc.status = "indexed"
+        db.commit()
+
+        # Index in Qdrant
+        KBRetrievalService().index_document(workspace_id, doc_id, chunks)
+
+    except Exception as exc:
+        import logging
+        logging.getLogger(__name__).error("KB processing failed for %s: %s", doc_id, exc)
+        try:
+            doc = db.get(KnowledgeDocument, doc_id)
+            if doc:
+                doc.status = "failed"
+                doc.error_message = str(exc)[:500]
+                db.commit()
+        except Exception:
+            pass
+    finally:
+        db.close()
+
+
+@router.post("/workspaces/{workspace_id}/knowledge", response_model=KnowledgeDocumentOut, status_code=202)
+async def upload_knowledge_document(
+    workspace_id: str,
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+) -> KnowledgeDocumentOut:
+    """Upload a document to the workspace knowledge base.
+
+    Processing (parsing, chunking, embedding) happens in the background.
+    Returns immediately with the document record and status='processing'.
+
+    Accepted file types: .pdf, .docx, .txt, .md
+    Limits: max 50 documents per workspace, max 50 MB per file, max 100 MB total.
+    """
+    from app.core.config import settings
+
+    repo = WorkspaceRepository(db)
+    if not repo.get(workspace_id):
+        raise HTTPException(status_code=404, detail="Workspace not found")
+
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="Missing filename")
+
+    suffix = Path(file.filename).suffix.lower()
+    if suffix not in _KB_ALLOWED_TYPES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported file type '{suffix}'. Allowed: {', '.join(_KB_ALLOWED_TYPES)}",
+        )
+
+    # Enforce limits
+    doc_count = repo.count_knowledge_documents(workspace_id)
+    if doc_count >= KB_MAX_DOCUMENTS_PER_WORKSPACE:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Knowledge base limit reached ({KB_MAX_DOCUMENTS_PER_WORKSPACE} documents max).",
+        )
+
+    # Read file bytes to check size
+    content = await file.read()
+    file_size = len(content)
+
+    if file_size > KB_MAX_FILE_SIZE_BYTES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"File too large ({file_size // 1024 // 1024} MB). Max 50 MB per file.",
+        )
+
+    total_bytes = repo.total_knowledge_size_bytes(workspace_id)
+    if total_bytes + file_size > KB_MAX_TOTAL_BYTES_PER_WORKSPACE:
+        raise HTTPException(
+            status_code=400,
+            detail="Workspace knowledge base total size limit (100 MB) exceeded.",
+        )
+
+    # Save file to disk
+    kb_dir = settings.storage_root / workspace_id / "knowledge"
+    kb_dir.mkdir(parents=True, exist_ok=True)
+    safe_name = f"{uuid.uuid4()}{suffix}"
+    file_path = kb_dir / safe_name
+    file_path.write_bytes(content)
+
+    # Create DB record
+    doc = KnowledgeDocument(
+        workspace_id=workspace_id,
+        filename=file.filename,
+        file_type=suffix.lstrip("."),
+        file_path=str(file_path),
+        file_size_bytes=file_size,
+        status="processing",
+    )
+    db.add(doc)
+    db.commit()
+    db.refresh(doc)
+
+    # Queue background processing
+    background_tasks.add_task(
+        _process_kb_document_bg,
+        doc.id,
+        str(file_path),
+        doc.file_type,
+        workspace_id,
+        None,  # db_session_factory placeholder (background task creates its own session)
+    )
+
+    return KnowledgeDocumentOut(
+        id=doc.id,
+        filename=doc.filename,
+        file_type=doc.file_type,
+        file_size_bytes=doc.file_size_bytes,
+        chunk_count=doc.chunk_count,
+        status=doc.status,
+        error_message=doc.error_message,
+        created_at=doc.created_at,
+    )
+
+
+@router.get("/workspaces/{workspace_id}/knowledge/{document_id}/status")
+def knowledge_document_status(
+    workspace_id: str,
+    document_id: str,
+    db: Session = Depends(get_db),
+) -> dict:
+    """Check processing status of a KB document."""
+    repo = WorkspaceRepository(db)
+    doc = repo.get_knowledge_document(document_id)
+    if not doc or doc.workspace_id != workspace_id:
+        raise HTTPException(status_code=404, detail="Document not found")
+    return {
+        "id": doc.id,
+        "status": doc.status,
+        "chunk_count": doc.chunk_count,
+        "error_message": doc.error_message,
+    }
+
+
+@router.delete("/workspaces/{workspace_id}/knowledge/{document_id}", status_code=204)
+def delete_knowledge_document(
+    workspace_id: str,
+    document_id: str,
+    db: Session = Depends(get_db),
+) -> None:
+    """Remove a KB document and its chunks from both DB and Qdrant."""
+    from app.services.kb_retrieval import KBRetrievalService
+
+    repo = WorkspaceRepository(db)
+    doc = repo.get_knowledge_document(document_id)
+    if not doc or doc.workspace_id != workspace_id:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    # Remove Qdrant vectors first
+    KBRetrievalService().delete_document(workspace_id, document_id)
+
+    # Remove file from disk
+    try:
+        file_path = Path(doc.file_path)
+        if file_path.exists():
+            file_path.unlink()
+    except Exception:
+        pass
+
+    # Remove from DB (chunks cascade)
+    db.delete(doc)
+    db.commit()

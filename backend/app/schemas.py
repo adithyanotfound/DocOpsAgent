@@ -20,6 +20,17 @@ class VersionOut(BaseModel):
     created_at: datetime
 
 
+class KnowledgeDocumentOut(BaseModel):
+    id: str
+    filename: str
+    file_type: str
+    file_size_bytes: int
+    chunk_count: int
+    status: str
+    error_message: str | None = None
+    created_at: datetime
+
+
 class WorkspaceOut(BaseModel):
     id: str
     document_type: str
@@ -29,6 +40,7 @@ class WorkspaceOut(BaseModel):
     updated_at: datetime
     messages: list[MessageOut]
     versions: list[VersionOut]
+    knowledge_documents: list[KnowledgeDocumentOut] = []
 
 
 class ChatRequest(BaseModel):
