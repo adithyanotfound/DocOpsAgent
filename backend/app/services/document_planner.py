@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from typing import Any
 
 from app.services.llm_client import LLMClient, LLMRequest
@@ -36,10 +37,13 @@ Your job: Given a user's request, the document template's section structure, and
 CRITICAL RULES:
 1. TEMPLATE HEADINGS: You MUST preserve ALL headings defined in the template. Do not rename, skip, or reorder template headings unless the user explicitly says to.
 2. NEW SECTIONS: You may ADD new sections (e.g., Table of Contents, Conclusion, additional sub-sections) ONLY when the user explicitly requests them.
-3. GROUNDING: For each section, identify which KB chunks are most relevant. If no KB data is available for a section, use "kb_chunk_ids": [] and rely on general knowledge.
+3. GROUNDING: For each section, identify which KB chunks are most relevant by examining the chunk contents. Assign chunks generously — it's better to assign too many than too few. If no KB data is relevant, use "kb_chunk_ids": [] and instruct the generator to write a brief structural paragraph without specific claims.
 4. TABLE NUMBERING: If a section contains a table, assign it a sequential number (Table 1, Table 2, ...) with a descriptive caption.
 5. PROFESSIONAL FORMAT: Plan content that looks like a professional internal document: concise narrative paragraphs, well-structured tables with headers, numbered bullet points for key findings.
 6. TOC: Include a "toc" section at the very beginning ONLY if the user requests it or the template already has one.
+7. DATA OWNERSHIP: Each piece of KB data should appear in exactly ONE section. Assign financial metrics to "Financial Highlights", customer data to "Customer Insights", etc. The Executive Summary may reference key figures but should not contain detailed tables.
+8. FACT vs. GOAL DISTINCTION: The KB contains historical data (what happened). Do NOT reframe historical results as future targets or objectives unless the KB explicitly states them as goals. If a section is called "Business Objectives", note that the KB data is historical and instruct the generator accordingly.
+9. TABLE BUDGET: Assign at most ONE table per section. If the same data (e.g., revenue figures) appears relevant to multiple sections, assign the detailed table to the most specific section and reference it briefly in others.
 
 Return ONLY valid JSON in this exact structure:
 {
@@ -118,6 +122,9 @@ class DocumentPlanner:
 
         # Enrich plan with KB chunk references
         plan = self._enrich_with_kb_refs(plan, kb_context)
+        
+        # Deduplicate KB references
+        plan = self._deduplicate_plan(plan)
 
         return plan
 
@@ -142,23 +149,20 @@ class DocumentPlanner:
 
     def _format_kb_context(self, chunks: list[dict]) -> str:
         if not chunks:
-            return "(No knowledge base documents uploaded — use general knowledge)"
-
-        lines: list[str] = []
-        for i, chunk in enumerate(chunks[:20]):  # Limit to top 20 chunks in prompt
-            meta = chunk.get("metadata", {})
-            source = meta.get("source", "Unknown")
-            page = meta.get("page", "")
-            section = meta.get("section", "")
-            loc = f"[Source: {source}"
-            if page:
-                loc += f", Page {page}"
-            if section:
-                loc += f", Section: {section}"
-            loc += "]"
-            lines.append(f"Chunk {i} {loc}:\n{chunk.get('text', '')[:500]}")
-
-        return "\n\n".join(lines)
+            return "(No knowledge base documents uploaded)"
+        
+        by_source: dict[str, list[dict]] = {}
+        for i, chunk in enumerate(chunks):
+            source = chunk.get("metadata", {}).get("source", "Unknown")
+            by_source.setdefault(source, []).append({"idx": i, "text": chunk.get("text", "")})
+        
+        lines = []
+        for source, items in by_source.items():
+            lines.append(f"\n📄 {source} ({len(items)} chunks):")
+            for item in items[:10]:
+                preview = item["text"][:300].replace("\n", " ")
+                lines.append(f"  [Chunk {item['idx']}] {preview}")
+        return "\n".join(lines)
 
     def _format_history(self, history: list[dict] | None) -> str:
         if not history:
@@ -192,6 +196,32 @@ class DocumentPlanner:
 
         return plan
 
+    def _deduplicate_plan(self, plan: dict) -> dict:
+        """Ensure each KB chunk is assigned to at most 2 sections
+        (one primary, one brief reference in Executive Summary)."""
+        chunk_assignments: dict[str, list[str]] = {}
+        
+        for section in plan.get("sections", []):
+            for cid in section.get("kb_chunk_ids", []):
+                chunk_assignments.setdefault(cid, []).append(section.get("heading", ""))
+        
+        for section in plan.get("sections", []):
+            new_cids = []
+            heading = section.get("heading", "")
+            for cid in section.get("kb_chunk_ids", []):
+                assigned = chunk_assignments.get(cid, [])
+                if len(assigned) > 2:
+                    # Keep if it's the executive summary or if this is the most specific section.
+                    # Since we don't have a perfect "most specific" heuristic, we just keep the first two
+                    # assignments or Executive Summary.
+                    if "summary" in heading.lower() or assigned.index(heading) < 2:
+                        new_cids.append(cid)
+                else:
+                    new_cids.append(cid)
+            section["kb_chunk_ids"] = new_cids
+            
+        return plan
+
     def _fallback_plan(self, request: str, analysis: dict) -> dict:
         """Minimal fallback plan when LLM fails."""
         sections_raw = analysis.get("sections", [])
@@ -219,6 +249,3 @@ class DocumentPlanner:
                 "subsections": [],
             }]
         return {"document_title": request[:80], "sections": sections, "generation_notes": ""}
-
-
-import re  # noqa: E402 — imported here to avoid circular at top level

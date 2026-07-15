@@ -50,6 +50,7 @@ from app.services.document_planner import DocumentPlanner
 from app.services.section_generator import SectionGenerator
 from app.services.document_assembler import DocumentAssembler
 from app.services.kb_retrieval import KBRetrievalService
+from app.services.fact_verifier import FactVerifier
 
 MAX_ITERATIONS = 4
 
@@ -147,6 +148,7 @@ class DocumentAgentGraph:
         self.section_generator = SectionGenerator(llm=self.llm)
         self.doc_assembler = DocumentAssembler()
         self.kb_retrieval = KBRetrievalService()
+        self.fact_verifier = FactVerifier(llm=self.llm)
 
         self._graph = self._build()
 
@@ -870,18 +872,10 @@ class DocumentAgentGraph:
             await self._thought(state, thought2)
             return {"kb_context": [], "thoughts": state["thoughts"] + [thought, thought2]}
 
-        # Retrieve most relevant chunks via vector/keyword search
-        relevant = self.kb_retrieval.retrieve(
-            workspace_id=state["workspace_id"],
-            query=state["request"],
-            chunks_from_db=chunks_as_dicts,
-            limit=20,
-        )
-
-        thought2 = f"Retrieved {len(relevant)} relevant KB chunk(s) from {len(chunks_as_dicts)} total."
+        thought2 = f"Loaded {len(chunks_as_dicts)} KB chunk(s) for per-section retrieval."
         await self._thought(state, thought2)
         return {
-            "kb_context": relevant,
+            "kb_context": chunks_as_dicts,
             "thoughts": state["thoughts"] + [thought, thought2],
         }
 
@@ -905,16 +899,19 @@ class DocumentAgentGraph:
         }
 
     async def _generate_sections(self, state: AgentState) -> dict:
-        thought = "Generating content for each section (grounded in knowledge base)..."
+        thought = "Generating content for each section (per-section retrieval + inline verification)..."
         await self._thought(state, thought)
 
         sections = self.section_generator.generate_all_sections(
             document_plan=state["document_plan"],
             kb_context=state["kb_context"],
             template_analysis=state["template_analysis"],
+            workspace_id=state["workspace_id"],
+            kb_retrieval=self.kb_retrieval,
+            fact_verifier=self.fact_verifier,
         )
 
-        thought2 = f"Generated content for {len(sections)} section(s)."
+        thought2 = f"Generated and verified {len(sections)} section(s)."
         await self._thought(state, thought2)
         return {
             "generated_sections": sections,

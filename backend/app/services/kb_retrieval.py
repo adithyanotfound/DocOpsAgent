@@ -115,6 +115,33 @@ class KBRetrievalService:
             if "Not found" not in str(exc) and "404" not in str(exc):
                 log.warning("KB workspace delete from Qdrant failed: %s", exc)
 
+    def retrieve_for_section(
+        self,
+        workspace_id: str,
+        section_query: str,
+        fallback_chunks: list[dict],
+        limit: int = 15,
+    ) -> tuple[list[dict], bool]:
+        """Retrieve the most relevant chunks for a specific section via Qdrant.
+        
+        Returns (chunks, used_semantic). used_semantic=False means keyword fallback was used.
+        """
+        if self._can_use_qdrant():
+            try:
+                results = self._retrieve_semantic(workspace_id, section_query, fallback_chunks, limit)
+                if results:
+                    scores = [r.get("score", 0) for r in results]
+                    log.info(
+                        "Section '%s': retrieved %d chunks, scores min=%.3f median=%.3f max=%.3f",
+                        section_query[:60], len(results), min(scores), sorted(scores)[len(scores)//2], max(scores)
+                    )
+                    return results, True
+            except Exception as exc:
+                log.warning("Semantic section retrieval failed: %s. Falling back to keyword.", exc)
+        
+        # Keyword fallback — but flag it
+        return self._retrieve_local(section_query, fallback_chunks, limit), False
+
     # ------------------------------------------------------------------
     # Qdrant internals
     # ------------------------------------------------------------------
@@ -124,7 +151,7 @@ class KBRetrievalService:
 
     def _get_qdrant_client(self):
         from qdrant_client import QdrantClient
-        return QdrantClient(url=settings.qdrant_url, api_key=settings.qdrant_api_key or None)
+        return QdrantClient(url=settings.qdrant_url, api_key=settings.qdrant_api_key or None, timeout=60.0)
 
     def _get_embedding_client(self):
         if self._embed_client:
@@ -215,7 +242,7 @@ class KBRetrievalService:
                 must=[FieldCondition(key="workspace_id", match=MatchValue(value=workspace_id))]
             ),
             limit=limit,
-            score_threshold=0.35,
+            score_threshold=0.25,
         ).points
 
         # Map qdrant results back to full chunk records

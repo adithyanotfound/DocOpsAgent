@@ -93,6 +93,7 @@ class RetrievalService:
         return QdrantClient(
             url=settings.qdrant_url,
             api_key=settings.qdrant_api_key or None,
+            timeout=60.0,
         )
 
     def _ensure_collection(self, qdrant, vector_size: int) -> None:
