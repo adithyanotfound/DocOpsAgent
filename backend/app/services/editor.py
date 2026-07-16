@@ -1,19 +1,34 @@
-import re
+"""Content editor — rewrites document text blocks to fulfil a user request.
 
-from app.core.config import settings
+Uses LLMClient for provider-agnostic LLM calls (Gemini by default).
+Falls back to deterministic heuristics when no LLM is available.
+"""
+from __future__ import annotations
+
+import re
 
 
 class ContentEditor:
     """Rewrites document text blocks to fulfil a user request.
 
-    When an OpenAI API key is available the rewrite is delegated to the
-    configured model.  When no key is configured (or when the API call
-    fails) it falls back to the original deterministic heuristics so the
-    platform remains usable without credentials.
+    When an LLM is available the rewrite is delegated to it.
+    Falls back to deterministic heuristics so the platform remains
+    usable without credentials.
     """
 
-    def rewrite(self, request: str, text: str, metadata: dict | None = None, chat_history: list[dict] | None = None) -> str:
-        if settings.openai_api_key:
+    def __init__(self, llm=None) -> None:
+        # Accept optional injected LLMClient; constructed lazily if not provided
+        self._llm = llm
+
+    def rewrite(
+        self,
+        request: str,
+        text: str,
+        metadata: dict | None = None,
+        chat_history: list[dict] | None = None,
+    ) -> str:
+        from app.core.config import settings
+        if settings.gemini_api_key or settings.openai_api_key:
             try:
                 return self._rewrite_with_llm(request, text, metadata or {}, chat_history or [])
             except Exception:
@@ -24,33 +39,43 @@ class ContentEditor:
     # LLM path
     # ------------------------------------------------------------------
 
-    def _rewrite_with_llm(self, request: str, text: str, metadata: dict, chat_history: list[dict]) -> str:
-        from openai import OpenAI
+    def _rewrite_with_llm(
+        self,
+        request: str,
+        text: str,
+        metadata: dict,
+        chat_history: list[dict],
+    ) -> str:
         import json
+        from app.services.llm_client import LLMClient, LLMRequest
 
-        client = OpenAI(
-            api_key=settings.openai_api_key,
-            base_url=settings.openai_base_url or None,
-        )
+        llm = self._llm or LLMClient()
+
         system_prompt = (
-            "You are a precise document editing assistant. "
-            "You will be given an editing instruction, a specific text block from a document, "
-            "and its metadata (such as slide number, paragraph index, or section heading).\n\n"
+            "You are a precise document editing assistant evaluating ONE specific text block at a time.\n"
+            "You will be given an editing instruction, the text block itself, and its metadata.\n\n"
             "IMPORTANT RULES:\n"
-            "1. Only rewrite the text if it is DIRECTLY relevant to the instruction.\n"
-            "2. If the text block is NOT related to the instruction (e.g. the instruction targets a "
-            "different topic, section, or slide), return the original text EXACTLY as-is.\n"
-            "3. Never add, remove, or change content that is out of scope of the instruction.\n"
-            "4. Return ONLY the (possibly rewritten) text — no commentary, no markdown, no quotes."
+            "1. You must decide if the provided text block is the INTENDED TARGET of the instruction.\n"
+            "2. If the user asks to edit a 'title', 'heading', or 'topic', you MUST ASSUME the provided "
+            "text block IS the target and rewrite it, UNLESS the text block is obviously a footer, "
+            "slide number (like `‹#›` or a plain digit), or a specific field label (like `Theme Name:`).\n"
+            "3. If you decide the text block IS the target, return ONLY the new rewritten text.\n"
+            "4. If you decide the text block is NOT the target, you MUST return the ORIGINAL TEXT EXACTLY AS-IS. "
+            "Do not return any other text.\n"
+            "5. Provide no commentary, markdown, or quotes.\n"
+            "6. For formatting-related instructions (e.g. 'make it bold', 'center align', 'change font size'), "
+            "you cannot change formatting directly — only change the TEXT content. Return the text as-is if the "
+            "instruction is purely about formatting.\n"
+            "7. When writing content, ensure it is professional, well-structured, and compelling. "
+            "Use bullet points (•) for lists when appropriate."
         )
-        
+
         meta_str = json.dumps(metadata) if metadata else "None"
-        
-        # Build chat history context
+
         history_str = ""
         if chat_history:
             history_str = "Previous conversation context:\n"
-            for msg in chat_history[-5:]: # Only include the last 5 messages to avoid blowing up context
+            for msg in chat_history[-5:]:
                 role = "User" if msg["role"] == "user" else "Agent"
                 history_str += f"{role}: {msg['content']}\n"
             history_str += "\n"
@@ -59,20 +84,17 @@ class ContentEditor:
             f"{history_str}"
             f"Editing instruction: {request}\n\n"
             f"Text block to consider:\n{text}\n\n"
-            f"Block metadata: {meta_str}\n\n"
-            "Return the rewritten text if relevant, or the original text unchanged if not relevant."
+            f"Block metadata: {meta_str}"
         )
-        response = client.chat.completions.create(
-            model=settings.llm_model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
+
+        response = llm.complete(LLMRequest(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
             temperature=0.3,
             max_tokens=1024,
-        )
-        result = (response.choices[0].message.content or text).strip()
-        return result
+            json_mode=False,  # Raw text response
+        ))
+        return response.text or text
 
     # ------------------------------------------------------------------
     # Local fallback heuristics

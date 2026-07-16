@@ -4,6 +4,7 @@ export type AgentContent = {
   text: string;
   version_number: number | null;
   version_label: string | null;
+  needs_image?: boolean;
 };
 
 export type Message = {
@@ -11,6 +12,7 @@ export type Message = {
   role: "user" | "assistant";
   content: string;
   content_parsed: AgentContent | null;
+  image_url?: string;
   created_at: string;
 };
 
@@ -19,6 +21,17 @@ export type Version = {
   version_number: number;
   document_url: string;
   pdf_url: string;
+  created_at: string;
+};
+
+export type KnowledgeDocument = {
+  id: string;
+  filename: string;
+  file_type: string;
+  file_size_bytes: number;
+  chunk_count: number;
+  status: "processing" | "indexed" | "failed";
+  error_message?: string | null;
   created_at: string;
 };
 
@@ -31,6 +44,7 @@ export type Workspace = {
   updated_at: string;
   messages: Message[];
   versions: Version[];
+  knowledge_documents: KnowledgeDocument[];
 };
 
 export type SocketEvent =

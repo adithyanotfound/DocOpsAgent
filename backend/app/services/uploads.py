@@ -30,8 +30,13 @@ class UploadService:
                 handle.write(chunk)
 
         pdf_path = self.storage.version_pdf_path(workspace.id, 1)
-        self.preview.convert_to_pdf(document_path, pdf_path)
+        await self.preview.convert_to_pdf(document_path, pdf_path)
         structure = self.processor.extract(document_path, document_type)
+
+        import json
+        json_path = document_path.with_suffix(".json")
+        with json_path.open("w", encoding="utf-8") as f:
+            json.dump(structure, f, indent=2)
 
         self.db.add(
             DocumentVersion(

@@ -19,6 +19,7 @@ type AppState = {
   liveUserMessage: string | null;
   liveThoughts: string[];
   liveVersionTile: LiveVersionTile | null;
+  seenEventCount: number;
 
   setWorkspaceId: (id: string | null) => void;
   toggleSidebar: () => void;
@@ -26,8 +27,7 @@ type AppState = {
   setPinnedVersion: (version: number | null) => void;
 
   startAgentRun: (userMessage: string) => void;
-  pushThought: (thought: string) => void;
-  setLiveVersionTile: (tile: LiveVersionTile) => void;
+  applyPollEvents: (events: any[]) => void;
   endAgentRun: () => void;
 };
 
@@ -39,15 +39,46 @@ export const useAppStore = create<AppState>((set) => ({
   liveUserMessage: null,
   liveThoughts: [],
   liveVersionTile: null,
+  seenEventCount: 0,
 
   setWorkspaceId: (id) => set({ workspaceId: id, pinnedVersion: null }),
   toggleSidebar: () => set((s) => ({ sidebarOpen: !s.sidebarOpen })),
   setSidebarOpen: (open) => set({ sidebarOpen: open }),
   setPinnedVersion: (version) => set({ pinnedVersion: version }),
 
-  startAgentRun: (userMessage) => set({ isAgentRunning: true, liveUserMessage: userMessage, liveThoughts: [], liveVersionTile: null, pinnedVersion: null }),
-  pushThought: (thought) =>
-    set((s) => ({ liveThoughts: [...s.liveThoughts, thought] })),
-  setLiveVersionTile: (tile) => set({ liveVersionTile: tile }),
+  startAgentRun: (userMessage) => set({ 
+    isAgentRunning: true, 
+    liveUserMessage: userMessage, 
+    liveThoughts: [], 
+    liveVersionTile: null, 
+    pinnedVersion: null,
+    seenEventCount: 0
+  }),
+  applyPollEvents: (events) => set((s) => {
+    // Only process new events
+    if (events.length <= s.seenEventCount) return s;
+    
+    const newEvents = events.slice(s.seenEventCount);
+    let updatedThoughts = [...s.liveThoughts];
+    let updatedVersionTile = s.liveVersionTile;
+    
+    for (const ev of newEvents) {
+      if (ev.type === "thought") {
+        updatedThoughts.push(ev.content);
+      } else if (ev.type === "version_created") {
+        updatedVersionTile = {
+          version_number: ev.version_number,
+          pdf_url: ev.pdf_url,
+          document_url: ev.document_url,
+        };
+      }
+    }
+    
+    return {
+      liveThoughts: updatedThoughts,
+      liveVersionTile: updatedVersionTile,
+      seenEventCount: events.length
+    };
+  }),
   endAgentRun: () => set({ isAgentRunning: false, liveUserMessage: null }),
 }));

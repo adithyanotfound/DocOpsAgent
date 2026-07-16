@@ -2,7 +2,7 @@ import json
 
 from app.models import DocumentVersion, Workspace
 from app.repositories import WorkspaceRepository
-from app.schemas import MessageOut, VersionOut, WorkspaceOut
+from app.schemas import KnowledgeDocumentOut, MessageOut, VersionOut, WorkspaceOut
 
 
 def file_url(version: DocumentVersion, path_value: str) -> str:
@@ -23,6 +23,7 @@ def _parse_content(content: str) -> dict | None:
 def serialize_workspace(workspace: Workspace, repo: WorkspaceRepository) -> WorkspaceOut:
     versions = repo.versions(workspace.id)
     messages = repo.messages(workspace.id)
+    knowledge_docs = repo.list_knowledge_documents(workspace.id)
     return WorkspaceOut(
         id=workspace.id,
         document_type=workspace.document_type,
@@ -49,5 +50,18 @@ def serialize_workspace(workspace: Workspace, repo: WorkspaceRepository) -> Work
                 created_at=v.created_at,
             )
             for v in versions
+        ],
+        knowledge_documents=[
+            KnowledgeDocumentOut(
+                id=d.id,
+                filename=d.filename,
+                file_type=d.file_type,
+                file_size_bytes=d.file_size_bytes,
+                chunk_count=d.chunk_count,
+                status=d.status,
+                error_message=d.error_message,
+                created_at=d.created_at,
+            )
+            for d in knowledge_docs
         ],
     )
