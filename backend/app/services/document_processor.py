@@ -1154,54 +1154,24 @@ class DocumentProcessor:
             return f"Set document background color to #{bg_color}"
         elif action == "set_margins":
             inches = params.get("margin_inches")
-            top_inches = params.get("top_margin_inches")
-            bottom_inches = params.get("bottom_margin_inches")
-            left_inches = params.get("left_margin_inches")
-            right_inches = params.get("right_margin_inches")
-            
-            from docx.shared import Inches
-            changes = []
-            
-            for section in doc.sections:
-                if inches is not None:
+            if inches:
+                from docx.shared import Inches
+                for section in doc.sections:
                     section.left_margin = Inches(inches)
                     section.right_margin = Inches(inches)
                     section.top_margin = Inches(inches)
                     section.bottom_margin = Inches(inches)
-                    if "all" not in changes: changes.append("all")
-                if left_inches is not None:
-                    section.left_margin = Inches(left_inches)
-                    if "left" not in changes: changes.append("left")
-                if right_inches is not None:
-                    section.right_margin = Inches(right_inches)
-                    if "right" not in changes: changes.append("right")
-                if top_inches is not None:
-                    section.top_margin = Inches(top_inches)
-                    if "top" not in changes: changes.append("top")
-                if bottom_inches is not None:
-                    section.bottom_margin = Inches(bottom_inches)
-                    if "bottom" not in changes: changes.append("bottom")
-                    
-            if not changes:
-                return "No margin values provided."
-            return f"Set document margins ({', '.join(changes)})"
+                return f"Set document margins to {inches} inches"
         elif action == "add_page_numbers":
             from docx.oxml import OxmlElement
             from docx.oxml.ns import qn
             from docx.enum.text import WD_ALIGN_PARAGRAPH
             for section in doc.sections:
-                section.footer.is_linked_to_previous = False
                 footer = section.footer
-                
-                # Try to use the first existing paragraph, otherwise add one
-                if footer.paragraphs:
-                    p = footer.paragraphs[0]
-                    # Clear existing runs safely
-                    for r in list(p.runs):
-                        r._r.getparent().remove(r._r)
-                else:
-                    p = footer.add_paragraph()
-                    
+                # Clear existing footer paragraphs to avoid stacking
+                for p in list(footer.paragraphs):
+                    p._p.getparent().remove(p._p)
+                p = footer.add_paragraph()
                 p.alignment = WD_ALIGN_PARAGRAPH.CENTER
                 run = p.add_run("Page ")
                 fldChar1 = OxmlElement('w:fldChar')
@@ -1439,9 +1409,6 @@ class DocumentProcessor:
                 start_pos, end_pos = end_pos, start_pos
 
             if start_pos <= before_pos <= end_pos or start_pos <= after_pos <= end_pos:
-                if after_pos == end_pos or before_pos == start_pos:
-                    # Target is the boundary of the moved block itself. This means it's already exactly where it should be.
-                    return f"Moved {end_pos - start_pos + 1} block(s) to identical position (already in correct order)"
                 return f"Moved {end_pos - start_pos + 1} block(s) (no-op because target is inside the moved block)"
 
             # Collect the xml elements to move

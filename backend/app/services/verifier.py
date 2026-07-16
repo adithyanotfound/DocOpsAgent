@@ -45,9 +45,8 @@ class Verifier:
             "and a structural/textual diff of what actually changed in the document.\n"
             "Determine if each planned task has been successfully satisfied.\n\n"
             "RULES:\n"
-            "1. Be strict for structural changes. Check the 'heading_order_after' list. If a task says 'move section X before Y', ensure X comes before Y in the final list.\n"
-            "   IMPORTANT: If the 'heading_order_after' ALREADY satisfies the user's requested state (e.g. they asked to put X after Y, and X is indeed after Y), you MUST mark the task as SATISFIED, even if the diff shows no changes!\n"
-            "   Do NOT fail a task just because the document was already in the correct state and the diff is empty.\n"
+            "1. Be strict for structural changes. If a task says 'move section X before Y' but the order of headings in the outline "
+            "shows X is still after Y, mark it as satisfied=false.\n"
             "2. Ensure you check the 'style_summary' field in the outline diff to verify formatting changes like spacing, font sizes, colors, and page breaks.\n"
             "3. If a task asks for complex aesthetic changes (like 'modernize tables' or 'make beautiful'), verify that at least some related style properties (like table_style, colors, or spacing) were updated in the diff.\n"
             "4. If all tasks are successfully satisfied, set 'all_satisfied' to true.\n"
@@ -69,7 +68,6 @@ class Verifier:
         user_prompt = (
             f"Original Request: {request}\n\n"
             f"Decomposed Tasks:\n{json.dumps(tasks, indent=2)}\n\n"
-            f"Current Document Headings (After Operation):\n{json.dumps(diff.get('heading_order_after', []), indent=2)}\n\n"
             f"Outline Diff of Document Changes:\n{json.dumps(diff, indent=2)}"
         )
 

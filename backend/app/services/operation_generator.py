@@ -243,10 +243,6 @@ _THEME_OP_SCHEMA = """Return a JSON array of theme_op operations:
       "action": "set_bg_color"|"set_margins"|"add_page_numbers"|"apply_theme_colors",
       "bg_color_hex": "HEX_or_null",
       "margin_inches": number_or_null,
-      "top_margin_inches": number_or_null,
-      "bottom_margin_inches": number_or_null,
-      "left_margin_inches": number_or_null,
-      "right_margin_inches": number_or_null,
       "accent_colors": ["HEX1", "HEX2"] or null
     }
   }
