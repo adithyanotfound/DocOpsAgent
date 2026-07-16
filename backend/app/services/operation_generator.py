@@ -114,26 +114,92 @@ _IMAGE_OP_SCHEMA = """Return a JSON array of image_op operations:
 ]
 """
 
-_LAYOUT_OP_SCHEMA = """Return a JSON array of layout_op operations:
-[
-  {
-    "op_type": "layout_op",
-    "target_id": "null or 'all' or list of IDs",
-    "parameters": {
-      "action": "move_block"|"insert_page_break"|"remove_block"|"duplicate_block"|"insert_block"|"insert_toc",
-      "start_id": "id_of_first_element_to_move_or_remove",
-      "end_id": "id_of_last_element_to_move_or_remove",
-      "before_id": "id_of_anchor_to_insert_before",
-      "after_id": "id_of_anchor_to_insert_after",
-      "data": [
-        {"role": "heading", "text": "Heading text", "heading_level": 2},
-        {"role": "body", "text": "Paragraph content text"},
-        {"role": "table", "headers": ["Col 1", "Col 2"], "rows": [["A", "B"], ["C", "D"]]}
-      ]
-    }
-  }
-]
+_LAYOUT_OP_SCHEMA = """Return a JSON array of layout_op operations.
+Each operation has "op_type": "layout_op", "target_id": null, and a "parameters" object.
+
+ACTIONS AND THEIR PARAMETERS:
+
+=== move_block ===
+Move a section (heading + content) to a new location. One section relocates; the other stays.
+{
+  "action": "move_block",
+  "start_id": "ID of the first element of the section to MOVE (from Section Range start_id)",
+  "end_id": "ID of the last element of the section to MOVE (from Section Range end_id)",
+  "before_id": "ID of the element to insert BEFORE (use 'Move anchor' before_id if provided)",
+  "after_id": "ID of the element to insert AFTER (use 'Move anchor' after_id if provided)"
+}
+NOTE: Provide EITHER before_id OR after_id, not both. Use the 'Move anchor' values from the context.
+
+=== swap_sections ===
+Exchange two sections — both sections trade positions.
+{
+  "action": "swap_sections",
+  "section_a_start_id": "first element of section A (from Section A range)",
+  "section_a_end_id": "last element of section A",
+  "section_b_start_id": "first element of section B (from Section B range)",
+  "section_b_end_id": "last element of section B"
+}
+
+=== insert_page_break ===
+Insert a hard page break immediately before a specific element.
+{
+  "action": "insert_page_break",
+  "before_id": "ID of the element to insert the page break before (the section heading ID)"
+}
+NOTE: Use the heading ID of the section you want to start on a new page as before_id.
+
+=== insert_block ===
+Insert new content (paragraphs, bullets, tables, headings) at a specific location.
+{
+  "action": "insert_block",
+  "after_id": "ID of the element to insert AFTER (prefer the Section insertion anchor after_id)",
+  "data": [
+    {"role": "heading", "text": "Heading text", "heading_level": 2},
+    {"role": "body", "text": "Full paragraph prose (2-4 sentences, NOT bullet points)"},
+    {"role": "bullet_point", "text": "Single bullet item text"},
+    {"role": "table", "headers": ["Col 1", "Col 2"], "rows": [["A", "B"], ["C", "D"]]}
+  ]
+}
+
+=== set_columns ===
+Set a multi-column page layout (e.g., two columns side by side).
+{
+  "action": "set_columns",
+  "num_columns": 2,
+  "column_gap_inches": 0.5
+}
+
+=== remove_block ===
+Delete a range of elements from the document.
+{
+  "action": "remove_block",
+  "start_id": "ID of first element to remove",
+  "end_id": "ID of last element to remove"
+}
+
+=== duplicate_block ===
+Duplicate a range of elements to another location.
+{
+  "action": "duplicate_block",
+  "start_id": "ID of first element to duplicate",
+  "end_id": "ID of last element to duplicate",
+  "after_id": "ID of element to insert after"
+}
+
+CRITICAL RULES:
+1. move_block != swap_sections. Use move_block when the user says 'move X above/below Y' (only X relocates).
+   Use swap_sections when the user says 'swap X and Y' (both sections change positions).
+2. For move_block: set start_id/end_id from the 'Section Range' in context, and before_id/after_id
+   from the 'Move anchor' values provided. DO NOT set both before_id and after_id.
+3. For insert_page_break: set before_id to the heading element ID of the section that should start
+   on the new page. Use the 'Target Element ID(s)' from context if it contains a heading ID.
+4. For insert_block: GROUP ALL items into ONE operation. If the user asks for 3 paragraphs,
+   emit ONE insert_block with ALL 3 items in data[]. NEVER emit multiple insert_block ops.
+5. For set_columns: this applies a document-level column layout — use when user asks for
+   'two-column layout', 'multi-column', or 'side-by-side columns'.
+6. Output ONLY the raw JSON array — no markdown, no commentary.
 """
+
 
 _LIST_OP_SCHEMA = """Return a JSON array of list_op operations:
 [
@@ -177,6 +243,10 @@ _THEME_OP_SCHEMA = """Return a JSON array of theme_op operations:
       "action": "set_bg_color"|"set_margins"|"add_page_numbers"|"apply_theme_colors",
       "bg_color_hex": "HEX_or_null",
       "margin_inches": number_or_null,
+      "top_margin_inches": number_or_null,
+      "bottom_margin_inches": number_or_null,
+      "left_margin_inches": number_or_null,
+      "right_margin_inches": number_or_null,
       "accent_colors": ["HEX1", "HEX2"] or null
     }
   }
@@ -287,7 +357,7 @@ class OperationGenerator:
     def generate_for_task(
         self,
         task: dict,
-        resolved_ids: list[str],
+        resolved_ids: dict,
         element_context: dict[str, dict],
         outline: dict,
         attached_image_path: str | None = None,
@@ -311,13 +381,37 @@ class OperationGenerator:
 
         # Build task-specific context
         import json
-        resolved_str = json.dumps(resolved_ids)
+        ids_list = resolved_ids.get("ids", []) if isinstance(resolved_ids, dict) else resolved_ids
+        after_anchor_id = resolved_ids.get("after_anchor_id") if isinstance(resolved_ids, dict) else None
+        section_range = resolved_ids.get("section_range") if isinstance(resolved_ids, dict) else None
+        
+        resolved_str = json.dumps(ids_list)
         context_str = json.dumps(element_context, indent=2)
-        outline_summary = json.dumps({
-            "document_type": outline.get("document_type"),
-            "title": outline.get("title"),
-            "indices": outline.get("indices"),
-        }, indent=2)
+        
+        # Include full sections list in outline summary for layout_op so the model 
+        # can pick correct section boundaries for swap_sections
+        if task_type == "layout_op":
+            outline_summary = json.dumps({
+                "document_type": outline.get("document_type"),
+                "title": outline.get("title"),
+                "indices": outline.get("indices"),
+                "sections": [
+                    {
+                        "heading": s.get("heading"),
+                        "heading_id": s.get("heading_id"),
+                        "section_start_id": s.get("section_start_id"),
+                        "section_end_id": s.get("section_end_id"),
+                    }
+                    for s in outline.get("sections", [])
+                    if s.get("heading_id") != "start"
+                ],
+            }, indent=2)
+        else:
+            outline_summary = json.dumps({
+                "document_type": outline.get("document_type"),
+                "title": outline.get("title"),
+                "indices": outline.get("indices"),
+            }, indent=2)
 
         repair_str = ""
         if verifier_feedback and previous_ops:
@@ -327,6 +421,24 @@ class OperationGenerator:
                 f"Verifier Feedback: {verifier_feedback}\n"
                 f"Please fix the operations to satisfy this feedback.\n"
             )
+
+        # Build anchor hint for section-end insertions, swaps, and moves
+        before_anchor_id = resolved_ids.get("before_anchor_id") if isinstance(resolved_ids, dict) else None
+        anchor_hint = ""
+        if before_anchor_id:
+            anchor_hint = f"\nMove anchor - insert the section BEFORE this element (use as before_id in move_block): {before_anchor_id}\n"
+        elif after_anchor_id:
+            anchor_hint = f"\nSection insertion anchor (use this as after_id): {after_anchor_id}\n"
+        if section_range:
+            anchor_hint += f"Section range (the content to move): start_id={section_range.get('start_id')}, end_id={section_range.get('end_id')}\n"
+            
+        section_a_range = resolved_ids.get("section_a_range") if isinstance(resolved_ids, dict) else None
+        section_b_range = resolved_ids.get("section_b_range") if isinstance(resolved_ids, dict) else None
+        
+        if section_a_range and section_b_range:
+            anchor_hint += f"Section A range (for swap): start_id={section_a_range.get('start_id')}, end_id={section_a_range.get('end_id')}\n"
+            anchor_hint += f"Section B range (for swap): start_id={section_b_range.get('start_id')}, end_id={section_b_range.get('end_id')}\n"
+
 
         system_prompt = (
             f"You are a document operations generator specializing in '{task_type}' changes.\n"
@@ -344,6 +456,7 @@ class OperationGenerator:
         user_prompt = (
             f"Task: {task['description']}\n"
             f"Target Element ID(s): {resolved_str}\n"
+            f"{anchor_hint}"
             f"Element Context: {context_str}\n"
             f"Outline: {outline_summary}\n"
             f"Attached Image: {attached_image_path or 'None'}\n"

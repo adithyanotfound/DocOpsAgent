@@ -55,6 +55,19 @@ log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# Custom IDs (UUID stamping for stable element identities)
+# ---------------------------------------------------------------------------
+import uuid
+import shutil
+import tempfile
+from lxml import etree
+from docx.oxml.ns import qn
+
+CUSTOM_NS = 'http://documenteditor.local/ids'
+CUSTOM_PREFIX = 'deid'
+etree.register_namespace(CUSTOM_PREFIX, CUSTOM_NS)
+
+# ---------------------------------------------------------------------------
 # Data classes
 # ---------------------------------------------------------------------------
 
@@ -729,6 +742,14 @@ class DocumentProcessor:
         if m := re.search(r'footer_(\d+)', target_id):
             tgt["footer_index"] = int(m.group(1))
             
+        # New: UUIDs
+        if m := re.search(r'p_([a-f0-9]{8})', target_id):
+            tgt["uid_paragraph"] = m.group(1)
+        elif m := re.search(r'img_([a-f0-9]{8})', target_id):
+            tgt["uid_image"] = m.group(1)
+        elif m := re.search(r't_([a-f0-9]{8})', target_id):
+            tgt["uid_table"] = m.group(1)
+            
         # image_N must be checked before paragraph_N to avoid partial match
         if re.match(r'^image_\d+$', target_id):
             m = re.search(r'image_(\d+)', target_id)
@@ -748,6 +769,47 @@ class DocumentProcessor:
         if m := re.search(r'_run_(\d+)', target_id):
             tgt["run_index"] = int(m.group(1))
         return tgt
+
+    def _translate_uids_to_indices(self, doc: Document, tgt: dict) -> None:
+        """Translates UID fields back to legacy sequential indices so downstream ops work."""
+        if "uid_paragraph" in tgt:
+            target_p = None
+            for eid, child in self._build_docx_body_index(doc):
+                if eid == f"p_{tgt['uid_paragraph']}":
+                    target_p = child
+                    break
+            if target_p is not None:
+                for i, p in enumerate(doc.paragraphs):
+                    if p._p == target_p:
+                        tgt["paragraph_index"] = i
+                        break
+        elif "uid_table" in tgt:
+            target_t = None
+            for eid, child in self._build_docx_body_index(doc):
+                if eid == f"t_{tgt['uid_table']}":
+                    target_t = child
+                    break
+            if target_t is not None:
+                for i, t in enumerate(doc.tables):
+                    if t._tbl == target_t:
+                        tgt["table_index"] = i
+                        break
+        elif "uid_image" in tgt:
+            target_i = None
+            for eid, child in self._build_docx_body_index(doc):
+                if eid == f"img_{tgt['uid_image']}":
+                    target_i = child
+                    break
+            if target_i is not None:
+                img_idx = 0
+                for p in doc.paragraphs:
+                    from docx.oxml.ns import qn
+                    has_drawing = p._p.find(f'.//{qn("w:drawing")}') is not None
+                    if has_drawing:
+                        if p._p == target_i:
+                            tgt["image_index"] = img_idx
+                            break
+                        img_idx += 1
 
     def _apply_pptx_operations(
         self,
@@ -882,6 +944,57 @@ class DocumentProcessor:
                 pass
         return doc.paragraphs
 
+    def _build_legacy_id_map(self, doc: Document) -> dict[str, str]:
+        """Maps legacy outline IDs (paragraph_1) to new stable UUIDs (p_abcdef)."""
+        # Ensure all elements have UIDs stamped in memory before mapping!
+        self._build_docx_body_index(doc)
+        
+        from docx.oxml.ns import qn
+        WNS_P = qn('w:p')
+        WNS_TBL = qn('w:tbl')
+        WNS_DRAWING = qn('w:drawing')
+        uid_attr = f'{{{CUSTOM_NS}}}uid'
+
+        legacy_map = {}
+        para_counter = 0
+        table_counter = 0
+        image_counter = 0
+
+        for child in doc.element.body:
+            tag = child.tag
+            uid = child.get(uid_attr)
+            
+            if tag in (WNS_P, WNS_TBL):
+                if tag == WNS_P:
+                    has_drawing = child.find(f'.//{WNS_DRAWING}') is not None
+                    if has_drawing:
+                        image_counter += 1
+                        legacy_id = f"image_{image_counter}"
+                        primary_id = f"img_{uid}" if uid else legacy_id
+                    else:
+                        para_counter += 1
+                        legacy_id = f"paragraph_{para_counter}"
+                        primary_id = f"p_{uid}" if uid else legacy_id
+                else:
+                    table_counter += 1
+                    legacy_id = f"table_{table_counter}"
+                    primary_id = f"t_{uid}" if uid else legacy_id
+                
+                if uid:
+                    legacy_map[legacy_id] = primary_id
+
+        return legacy_map
+
+    def _translate_legacy_ids(self, doc: Document, params: dict) -> None:
+        """Translates legacy IDs in operation parameters to new UUIDs."""
+        legacy_map = self._build_legacy_id_map(doc)
+        keys_to_check = ["start_id", "end_id", "before_id", "after_id", "section_a_start_id", "section_a_end_id", "section_b_start_id", "section_b_end_id", "_raw_target_id", "target_id"]
+        for k in keys_to_check:
+            if k in params and isinstance(params[k], str) and params[k] in legacy_map:
+                params[k] = legacy_map[params[k]]
+            elif k in params and isinstance(params[k], list):
+                params[k] = [legacy_map.get(pid, pid) for pid in params[k]]
+
     def _apply_docx_operations(
         self,
         source: Path,
@@ -896,9 +1009,14 @@ class DocumentProcessor:
         for raw_op in operations:
             op_type = raw_op.get("op_type", "")
             
+            # Translate legacy IDs in the operation itself and its parameters
+            self._translate_legacy_ids(doc, raw_op)
+            if "parameters" in raw_op and isinstance(raw_op["parameters"], dict):
+                self._translate_legacy_ids(doc, raw_op["parameters"])
+            
             # Structural ops do not loop over target_ids
             if op_type in {"list_op", "layout_op", "theme_op", "ai_design_op", "meta_op", "style_op", "find_replace", "slide_op"}:
-                params = raw_op.get("parameters", {})
+                params = dict(raw_op.get("parameters", {}))
                 if "target_id" in raw_op:
                     params["_raw_target_id"] = raw_op.get("target_id")
 
@@ -942,6 +1060,7 @@ class DocumentProcessor:
                 op_type = op.get("op_type", "")
                 params = op.get("parameters", {})
                 tgt = self._parse_target_id(op.get("target_id") or "")
+                self._translate_uids_to_indices(doc, tgt)
 
                 try:
                     if op_type == "text_edit":
@@ -1035,24 +1154,54 @@ class DocumentProcessor:
             return f"Set document background color to #{bg_color}"
         elif action == "set_margins":
             inches = params.get("margin_inches")
-            if inches:
-                from docx.shared import Inches
-                for section in doc.sections:
+            top_inches = params.get("top_margin_inches")
+            bottom_inches = params.get("bottom_margin_inches")
+            left_inches = params.get("left_margin_inches")
+            right_inches = params.get("right_margin_inches")
+            
+            from docx.shared import Inches
+            changes = []
+            
+            for section in doc.sections:
+                if inches is not None:
                     section.left_margin = Inches(inches)
                     section.right_margin = Inches(inches)
                     section.top_margin = Inches(inches)
                     section.bottom_margin = Inches(inches)
-                return f"Set document margins to {inches} inches"
+                    if "all" not in changes: changes.append("all")
+                if left_inches is not None:
+                    section.left_margin = Inches(left_inches)
+                    if "left" not in changes: changes.append("left")
+                if right_inches is not None:
+                    section.right_margin = Inches(right_inches)
+                    if "right" not in changes: changes.append("right")
+                if top_inches is not None:
+                    section.top_margin = Inches(top_inches)
+                    if "top" not in changes: changes.append("top")
+                if bottom_inches is not None:
+                    section.bottom_margin = Inches(bottom_inches)
+                    if "bottom" not in changes: changes.append("bottom")
+                    
+            if not changes:
+                return "No margin values provided."
+            return f"Set document margins ({', '.join(changes)})"
         elif action == "add_page_numbers":
             from docx.oxml import OxmlElement
             from docx.oxml.ns import qn
             from docx.enum.text import WD_ALIGN_PARAGRAPH
             for section in doc.sections:
+                section.footer.is_linked_to_previous = False
                 footer = section.footer
-                # Clear existing footer paragraphs to avoid stacking
-                for p in list(footer.paragraphs):
-                    p._p.getparent().remove(p._p)
-                p = footer.add_paragraph()
+                
+                # Try to use the first existing paragraph, otherwise add one
+                if footer.paragraphs:
+                    p = footer.paragraphs[0]
+                    # Clear existing runs safely
+                    for r in list(p.runs):
+                        r._r.getparent().remove(r._r)
+                else:
+                    p = footer.add_paragraph()
+                    
                 p.alignment = WD_ALIGN_PARAGRAPH.CENTER
                 run = p.add_run("Page ")
                 fldChar1 = OxmlElement('w:fldChar')
@@ -1175,39 +1324,85 @@ class DocumentProcessor:
             'lvl_text': lvl_text_val,
         }
 
+    def _renumber_headings_in_doc(self, doc) -> int:
+        """Re-sequence numbered heading text after structural operations (swap, move).
+
+        Detects headings whose visible text starts with a numeric prefix like "1. " or "3. "
+        and renumbers them sequentially in document order at each heading level.
+        Returns the number of headings that were actually renumbered.
+        """
+        import re as _re
+        _NUMBERED_PREFIX = _re.compile(r'^(\d+)\.\s+(.+)$', _re.DOTALL)
+
+        # Collect all heading paragraphs in body order
+        heading_paras = []
+        for para in doc.paragraphs:
+            style_name = para.style.name if para.style else ""
+            if style_name.lower().startswith("heading"):
+                m = _re.search(r'(\d+)$', style_name)
+                level = int(m.group(1)) if m else 1
+                heading_paras.append((level, para))
+
+        if not heading_paras:
+            return 0
+
+        # Build per-level counters, reset child counters when parent increments
+        level_counters: dict[int, int] = {}
+        changed = 0
+
+        for level, para in heading_paras:
+            # Reset all deeper level counters when we encounter this level
+            deeper_keys = [k for k in level_counters if k > level]
+            for k in deeper_keys:
+                del level_counters[k]
+
+            level_counters[level] = level_counters.get(level, 0) + 1
+            current_num = level_counters[level]
+
+            current_text = para.text.strip()
+            pm = _NUMBERED_PREFIX.match(current_text)
+            if pm:
+                existing_num = int(pm.group(1))
+                title_part = pm.group(2)
+                if existing_num != current_num:
+                    new_text = f"{current_num}. {title_part}"
+                    self._apply_run_aware_replacement(para, new_text)
+                    changed += 1
+
+        return changed
+
     def _build_docx_body_index(self, doc) -> list[tuple[str, object]]:
         """Walk doc.element.body in order and return a flat list of (id, xml_element) pairs.
 
-        IDs match those assigned in _extract_docx_dom:
-          - Image paragraphs:  'image_N'     (paragraphs containing <w:drawing>)
-          - Plain paragraphs:  'paragraph_N' where N is the paragraph's index in doc.paragraphs
-          - Tables:            'table_N'     where N is the table's index in doc.tables
-          - All other body children (e.g. w:sectPr): 'body_other_N'
+        IDs are resolved from the `deid:uid` custom XML attribute.
         """
         from docx.oxml.ns import qn
         WNS_P = qn('w:p')
         WNS_TBL = qn('w:tbl')
         WNS_DRAWING = qn('w:drawing')
+        
+        uid_attr = f'{{{CUSTOM_NS}}}uid'
 
-        para_counter = 1
-        table_counter = 1
-        image_counter = 1
         other_counter = 1
         result = []
         for child in doc.element.body:
             tag = child.tag
-            if tag == WNS_P:
-                # Check if this paragraph contains an inline image (w:drawing)
-                has_drawing = child.find(f'.//{WNS_DRAWING}') is not None
-                if has_drawing:
-                    result.append((f"image_{image_counter}", child))
-                    image_counter += 1
+            if tag in (WNS_P, WNS_TBL):
+                uid = child.get(uid_attr)
+                if not uid:
+                    # Fallback for newly inserted elements that missed stamping
+                    import uuid
+                    uid = uuid.uuid4().hex[:8]
+                    child.set(uid_attr, uid)
+                
+                if tag == WNS_P:
+                    has_drawing = child.find(f'.//{WNS_DRAWING}') is not None
+                    if has_drawing:
+                        result.append((f"img_{uid}", child))
+                    else:
+                        result.append((f"p_{uid}", child))
                 else:
-                    result.append((f"paragraph_{para_counter}", child))
-                para_counter += 1
-            elif tag == WNS_TBL:
-                result.append((f"table_{table_counter}", child))
-                table_counter += 1
+                    result.append((f"t_{uid}", child))
             else:
                 result.append((f"body_other_{other_counter}", child))
                 other_counter += 1
@@ -1244,6 +1439,9 @@ class DocumentProcessor:
                 start_pos, end_pos = end_pos, start_pos
 
             if start_pos <= before_pos <= end_pos or start_pos <= after_pos <= end_pos:
+                if after_pos == end_pos or before_pos == start_pos:
+                    # Target is the boundary of the moved block itself. This means it's already exactly where it should be.
+                    return f"Moved {end_pos - start_pos + 1} block(s) to identical position (already in correct order)"
                 return f"Moved {end_pos - start_pos + 1} block(s) (no-op because target is inside the moved block)"
 
             # Collect the xml elements to move
@@ -1258,37 +1456,71 @@ class DocumentProcessor:
                 before_xml_el = body_index[before_pos][1]
                 for xml_el in elements_to_move:
                     before_xml_el.addprevious(xml_el)
-                return f"Moved {len(elements_to_move)} block(s) ('{start_id}'→'{end_id}') before '{before_id}'"
+                renumbered = self._renumber_headings_in_doc(doc)
+                suffix = f", renumbered {renumbered} heading(s)" if renumbered else ""
+                return f"Moved {len(elements_to_move)} block(s) ('{start_id}'→'{end_id}') before '{before_id}'{suffix}"
             elif after_pos != -1:
                 after_xml_el = body_index[after_pos][1]
                 for xml_el in reversed(elements_to_move):
                     after_xml_el.addnext(xml_el)
-                return f"Moved {len(elements_to_move)} block(s) ('{start_id}'→'{end_id}') after '{after_id}'"
+                renumbered = self._renumber_headings_in_doc(doc)
+                suffix = f", renumbered {renumbered} heading(s)" if renumbered else ""
+                return f"Moved {len(elements_to_move)} block(s) ('{start_id}'→'{end_id}') after '{after_id}'{suffix}"
 
         elif action == "insert_page_break":
-            before_id = params.get("before_id")
-            if not before_id:
-                return "insert_page_break requires before_id"
+            # Accept before_id, start_id (fallback), or after_id
+            before_id = params.get("before_id") or params.get("start_id")
+            after_id_pb = params.get("after_id")
+            if not before_id and not after_id_pb:
+                return "insert_page_break requires before_id or after_id"
 
             body_index = self._build_docx_body_index(doc)
             id_to_pos = {eid: i for i, (eid, _) in enumerate(body_index)}
-            before_pos = id_to_pos.get(before_id, -1)
-            if before_pos == -1:
-                return f"insert_page_break: element '{before_id}' not found"
-
-            before_xml_el = body_index[before_pos][1]
 
             # Build a paragraph containing a hard page break
             from docx.oxml import OxmlElement
             from docx.oxml.ns import qn
-            p = OxmlElement('w:p')
+            pb_p = OxmlElement('w:p')
             r = OxmlElement('w:r')
             br = OxmlElement('w:br')
             br.set(qn('w:type'), 'page')
             r.append(br)
-            p.append(r)
-            before_xml_el.addprevious(p)
-            return f"Inserted page break before '{before_id}'"
+            pb_p.append(r)
+
+            if before_id:
+                before_pos = id_to_pos.get(before_id, -1)
+                if before_pos == -1:
+                    return f"insert_page_break: element '{before_id}' not found"
+                body_index[before_pos][1].addprevious(pb_p)
+                return f"Inserted page break before '{before_id}'"
+            else:
+                after_pos = id_to_pos.get(after_id_pb, -1)
+                if after_pos == -1:
+                    return f"insert_page_break: element '{after_id_pb}' not found"
+                body_index[after_pos][1].addnext(pb_p)
+                return f"Inserted page break after '{after_id_pb}'"
+
+        elif action == "set_columns":
+            num_cols = int(params.get("num_columns", 2))
+            gap_inches = float(params.get("column_gap_inches", 0.5))
+            from docx.oxml import OxmlElement
+            from docx.oxml.ns import qn
+            body = doc.element.body
+            sectPr = body.find(qn("w:sectPr"))
+            if sectPr is None:
+                sectPr = OxmlElement("w:sectPr")
+                body.append(sectPr)
+            # Remove existing cols element
+            existing_cols = sectPr.find(qn("w:cols"))
+            if existing_cols is not None:
+                sectPr.remove(existing_cols)
+            cols = OxmlElement("w:cols")
+            cols.set(qn("w:num"), str(num_cols))
+            gap_twips = int(gap_inches * 1440)  # 1 inch = 1440 twips
+            cols.set(qn("w:space"), str(gap_twips))
+            cols.set(qn("w:equalWidth"), "1")
+            sectPr.append(cols)
+            return f"Set document to {num_cols}-column layout with {gap_inches}" + '" gap'
 
         elif action == "remove_block":
             start_id = params.get("start_id")
@@ -1348,7 +1580,22 @@ class DocumentProcessor:
 
             elements = [body_index[i][1] for i in range(start_pos, end_pos + 1)]
             import copy
+            import uuid
             cloned_elements = [copy.deepcopy(el) for el in elements]
+            
+            uid_attr = f'{{{CUSTOM_NS}}}uid'
+            from docx.oxml.ns import qn
+            WNS_P = qn('w:p')
+            WNS_TBL = qn('w:tbl')
+            for clone in cloned_elements:
+                if clone.tag in (WNS_P, WNS_TBL):
+                    clone.set(uid_attr, uuid.uuid4().hex[:8])
+                for nested in clone.iter(WNS_P):
+                    if nested != clone:
+                        nested.set(uid_attr, uuid.uuid4().hex[:8])
+                for nested in clone.iter(WNS_TBL):
+                    if nested != clone:
+                        nested.set(uid_attr, uuid.uuid4().hex[:8])
             
             current_target = target_xml_el
             for xml_el in cloned_elements:
@@ -1358,7 +1605,70 @@ class DocumentProcessor:
                     current_target.addnext(xml_el)
                     current_target = xml_el
             
-            return f"Duplicated {len(elements)} block(s) ('{start_id}'→'{end_id}')"
+            return f"Duplicated {len(elements)} block(s)"
+
+        elif action == "swap_sections":
+            a_start = params.get("section_a_start_id")
+            a_end = params.get("section_a_end_id")
+            b_start = params.get("section_b_start_id")
+            b_end = params.get("section_b_end_id")
+
+            if not all([a_start, a_end, b_start, b_end]):
+                return "swap_sections requires start/end ids for both sections"
+
+            body_index = self._build_docx_body_index(doc)
+            id_to_pos = {eid: i for i, (eid, _) in enumerate(body_index)}
+
+            a_start_pos = id_to_pos.get(a_start, -1)
+            a_end_pos = id_to_pos.get(a_end, -1)
+            b_start_pos = id_to_pos.get(b_start, -1)
+            b_end_pos = id_to_pos.get(b_end, -1)
+
+            if -1 in (a_start_pos, a_end_pos, b_start_pos, b_end_pos):
+                return "Failed to find block boundaries for swap_sections"
+
+            if a_start_pos > a_end_pos: a_start_pos, a_end_pos = a_end_pos, a_start_pos
+            if b_start_pos > b_end_pos: b_start_pos, b_end_pos = b_end_pos, b_start_pos
+
+            if a_start_pos > b_start_pos:
+                # Ensure A is always before B for easier logic
+                a_start_pos, a_end_pos, b_start_pos, b_end_pos = b_start_pos, b_end_pos, a_start_pos, a_end_pos
+
+            if a_end_pos >= b_start_pos:
+                return "Cannot swap overlapping or adjacent-intersecting sections"
+
+            # Collect elements
+            a_elements = [body_index[i][1] for i in range(a_start_pos, a_end_pos + 1)]
+            b_elements = [body_index[i][1] for i in range(b_start_pos, b_end_pos + 1)]
+
+            # Remove all from parent
+            for el in a_elements: el.getparent().remove(el)
+            for el in b_elements: el.getparent().remove(el)
+            
+            # Re-insert B where A was.
+            if a_start_pos == 0:
+                # B goes to start of body
+                for el in reversed(b_elements):
+                    doc.element.body.insert(0, el)
+            else:
+                pre_a_el = body_index[a_start_pos - 1][1]
+                for el in reversed(b_elements):
+                    pre_a_el.addnext(el)
+                    
+            # Re-insert A where B was.
+            if b_start_pos - 1 >= a_start_pos and b_start_pos - 1 <= a_end_pos:
+                # They were strictly adjacent. A goes right after B's new position.
+                last_b_el = b_elements[-1]
+                for el in reversed(a_elements):
+                    last_b_el.addnext(el)
+            else:
+                pre_b_el = body_index[b_start_pos - 1][1]
+                for el in reversed(a_elements):
+                    pre_b_el.addnext(el)
+
+            renumbered = self._renumber_headings_in_doc(doc)
+            suffix = f", renumbered {renumbered} heading(s)" if renumbered else ""
+            return f"Swapped sections ({len(a_elements)} blocks and {len(b_elements)} blocks){suffix}"
 
         elif action == "insert_block":
             before_id = params.get("before_id")
@@ -1479,7 +1789,21 @@ class DocumentProcessor:
                     new_elements.append(xml_el)
 
             current_target = target_xml_el
+            
+            import uuid
+            uid_attr = f'{{{CUSTOM_NS}}}uid'
+            from docx.oxml.ns import qn
+            WNS_P = qn('w:p')
+            WNS_TBL = qn('w:tbl')
             for xml_el in new_elements:
+                if xml_el.tag in (WNS_P, WNS_TBL):
+                    xml_el.set(uid_attr, uuid.uuid4().hex[:8])
+                for nested in xml_el.iter(WNS_P):
+                    if nested != xml_el:
+                        nested.set(uid_attr, uuid.uuid4().hex[:8])
+                for nested in xml_el.iter(WNS_TBL):
+                    if nested != xml_el:
+                        nested.set(uid_attr, uuid.uuid4().hex[:8])
                 if insert_before:
                     current_target.addprevious(xml_el)
                 else:
@@ -1539,6 +1863,12 @@ class DocumentProcessor:
             </w:sdt>
             """
             toc_elem = parse_xml(toc_xml)
+            
+            import uuid
+            uid_attr = f'{{{CUSTOM_NS}}}uid'
+            for p in toc_elem.iter(qn('w:p')):
+                p.set(uid_attr, uuid.uuid4().hex[:8])
+
             if insert_before:
                 target_xml_el.addprevious(toc_elem)
             else:
@@ -3980,18 +4310,33 @@ class DocumentProcessor:
         return font_size, color_hex
 
     def _extract_docx_dom(self, path: Path) -> dict:
-        """Extract DOCX DOM in true document body order.
-
-        Elements are assigned IDs that match their index in doc.paragraphs / doc.tables
-        (e.g. 'paragraph_0', 'table_0'), but each element also carries a ``body_index``
-        field that reflects its sequential position in the document body.  This lets the
-        LLM reason about which section comes before/after another without ambiguity.
-        """
+        """Extract DOCX DOM in true document body order using stable UUIDs."""
         from docx.oxml.ns import qn as _qn
         WNS_P = _qn('w:p')
         WNS_TBL = _qn('w:tbl')
+        WNS_DRAWING = _qn('w:drawing')
+        uid_attr = f'{{{CUSTOM_NS}}}uid'
 
         doc = Document(path)
+        
+        # --- UID STAMPING ---
+        any_uids_assigned = False
+        for child in doc.element.body:
+            if child.tag in (WNS_P, WNS_TBL):
+                if child.get(uid_attr) is None:
+                    child.set(uid_attr, uuid.uuid4().hex[:8])
+                    any_uids_assigned = True
+                    
+        if any_uids_assigned:
+            import tempfile
+            import shutil
+            tmp_fd, tmp_path = tempfile.mkstemp(suffix=".docx", dir=path.parent)
+            import os
+            os.close(tmp_fd)
+            doc.save(tmp_path)
+            shutil.move(tmp_path, path)
+        # --------------------
+
         children = []
 
         from app.services.docx_extensions import extract_metadata
@@ -4026,18 +4371,17 @@ class DocumentProcessor:
             })
 
         # Build lookup maps: xml element → python-docx object
-        para_elements = {p._p: (idx + 1, p) for idx, p in enumerate(doc.paragraphs)}
-        table_elements = {t._tbl: (idx + 1, t) for idx, t in enumerate(doc.tables)}
+        para_elements = {p._p: p for p in doc.paragraphs}
+        table_elements = {t._tbl: t for t in doc.tables}
 
         body_index = 0  # sequential position across all body children
-        image_counter = 1  # counter for image_N IDs
-        WNS_DRAWING = _qn('w:drawing')
 
         for child in doc.element.body:
             tag = child.tag
 
             if tag == WNS_P and child in para_elements:
-                idx, para = para_elements[child]
+                para = para_elements[child]
+                uid = child.get(uid_attr)
 
                 # ---- Check if this paragraph contains an inline image ----
                 has_image = child.find(f'.//{WNS_DRAWING}') is not None
@@ -4067,17 +4411,15 @@ class DocumentProcessor:
                             pass
 
                     children.append({
-                        "id": f"image_{image_counter}",
+                        "id": f"img_{uid}",
                         "body_index": body_index,
                         "type": "image",
                         "role": "inline_image",
-                        "paragraph_id": f"paragraph_{idx}",
                         "width_emu": width_emu,
                         "height_emu": height_emu,
                         "description": description,
                         "alignment": alignment_str,
                     })
-                    image_counter += 1
 
                 else:
                     # Regular text paragraph
@@ -4086,7 +4428,7 @@ class DocumentProcessor:
                         font_size, color_hex = self._resolve_docx_font_info(para, run)
                         font = run.font
                         runs.append({
-                            "id": f"paragraph_{idx}_run_{r_idx}",
+                            "id": f"p_{uid}_run_{r_idx}",
                             "type": "run",
                             "text": run.text,
                             "style": {
@@ -4149,7 +4491,7 @@ class DocumentProcessor:
                     adv_style = extract_advanced_paragraph_style(para)
 
                     node = {
-                        "id": f"paragraph_{idx}",
+                        "id": f"p_{uid}",
                         "body_index": body_index,
                         "type": "paragraph",
                         "role": role,
@@ -4189,7 +4531,8 @@ class DocumentProcessor:
                     children.append(node)
 
             elif tag == WNS_TBL and child in table_elements:
-                t_idx, table = table_elements[child]
+                table = table_elements[child]
+                uid = child.get(uid_attr)
 
                 rows = []
                 for r_idx, row in enumerate(table.rows):
@@ -4202,7 +4545,7 @@ class DocumentProcessor:
                                 font_size, color_hex = self._resolve_docx_font_info(para, run)
                                 font = run.font
                                 runs.append({
-                                    "id": f"table_{t_idx}_cell_{r_idx}_{c_idx}_para_{p_idx}_run_{r_run_idx}",
+                                    "id": f"t_{uid}_cell_{r_idx}_{c_idx}_para_{p_idx}_run_{r_run_idx}",
                                     "type": "run",
                                     "text": run.text,
                                     "style": {
@@ -4228,7 +4571,7 @@ class DocumentProcessor:
                             except Exception:
                                 pass
                             cell_paras.append({
-                                "id": f"table_{t_idx}_cell_{r_idx}_{c_idx}_para_{p_idx}",
+                                "id": f"t_{uid}_cell_{r_idx}_{c_idx}_para_{p_idx}",
                                 "type": "paragraph",
                                 "role": "table_cell_paragraph",
                                 "text": para.text.strip(),
@@ -4242,7 +4585,7 @@ class DocumentProcessor:
                                 "runs": runs,
                             })
                         cell_dict = {
-                            "id": f"table_{t_idx}_cell_{r_idx}_{c_idx}",
+                            "id": f"t_{uid}_cell_{r_idx}_{c_idx}",
                             "type": "cell",
                             "row": r_idx,
                             "column": c_idx,
@@ -4267,7 +4610,7 @@ class DocumentProcessor:
                         
                         cells.append(cell_dict)
                     rows.append({
-                        "id": f"table_{t_idx}_row_{r_idx}",
+                        "id": f"t_{uid}_row_{r_idx}",
                         "type": "row",
                         "row": r_idx,
                         "cells": cells,
@@ -4275,7 +4618,7 @@ class DocumentProcessor:
 
                 table_style_name = table.style.name if table.style else "Normal Table"
                 node = {
-                    "id": f"table_{t_idx}",
+                    "id": f"t_{uid}",
                     "body_index": body_index,
                     "type": "table",
                     "role": "table",
@@ -4320,17 +4663,26 @@ class DocumentProcessor:
         doc = Document(source)
         edit_map = {e["element_id"]: e for e in edits}
         
-        for idx, para in enumerate(doc.paragraphs):
-            eid = f"paragraph_{idx}"
+        uid_attr = f'{{{CUSTOM_NS}}}uid'
+        
+        for para in doc.paragraphs:
+            uid = para._p.get(uid_attr)
+            if not uid:
+                continue
+            eid = f"p_{uid}"
             if eid in edit_map:
                 edit = edit_map[eid]
                 self._apply_run_aware_replacement(para, edit["new_text"])
                 
-        for t_idx, table in enumerate(doc.tables):
+        for table in doc.tables:
+            uid = table._tbl.get(uid_attr)
+            if not uid:
+                continue
+            t_eid = f"t_{uid}"
             for r_idx, row in enumerate(table.rows):
                 for c_idx, cell in enumerate(row.cells):
                     for p_idx, para in enumerate(cell.paragraphs):
-                        eid = f"table_{t_idx}_cell_{r_idx}_{c_idx}_para_{p_idx}"
+                        eid = f"{t_eid}_cell_{r_idx}_{c_idx}_para_{p_idx}"
                         if eid in edit_map:
                             edit = edit_map[eid]
                             self._apply_run_aware_replacement(para, edit["new_text"])

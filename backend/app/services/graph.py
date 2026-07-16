@@ -84,7 +84,7 @@ class AgentState(TypedDict):
     accumulated_ops: list[dict]
     failed_tasks_feedback: dict[int, str]
 
-    resolved_ids: list[str]
+    resolved_ids: dict
     element_context: dict[str, dict]
     generated_ops: list[dict]
     verify_result: dict
@@ -480,7 +480,8 @@ class DocumentAgentGraph:
         }
 
     async def _fetch_task_context(self, state: AgentState) -> dict:
-        element_context = self.context_fetcher.fetch(state["resolved_ids"], state["structure"])
+        ids_to_fetch = state["resolved_ids"].get("ids", [])
+        element_context = self.context_fetcher.fetch(ids_to_fetch, state["structure"])
         return {"element_context": element_context}
 
     async def _generate_task_operations(self, state: AgentState) -> dict:
@@ -584,9 +585,19 @@ class DocumentAgentGraph:
             operations=enriched_ops,
         )
 
+        # Re-extract structure + rebuild outline so that repair cycles use fresh UIDs.
+        # The temp_path DOM has been mutated by operations above; the old structure_json
+        # still points to stale IDs from before the edit. Without this, any repair cycle
+        # that calls resolve_task_references will resolve against old IDs that no longer
+        # exist in the document, causing "Failed to find block boundaries" errors.
+        new_structure = self.processor.extract(temp_path, state["document_type"])
+        new_outline = OutlineBuilder.build(new_structure, state["document_type"])
+
         return {
             "source_document_path": str(temp_path),
             "op_summaries": summaries,
+            "structure": new_structure,
+            "outline": new_outline,
             "thoughts": state["thoughts"] + [thought]
         }
 
@@ -683,6 +694,9 @@ class DocumentAgentGraph:
             structure_json=state["structure"],
         ))
         self.db.commit()
+        
+        # Sync updated document structure to vector index
+        self.retrieval.sync_workspace(state["workspace_id"], state["structure"])
         
         pdf_url  = f"/api/files/{state['workspace_id']}/v{new_version}.pdf"
         doc_url  = f"/api/files/{state['workspace_id']}/v{new_version}.{state['document_type']}"
@@ -940,9 +954,14 @@ class DocumentAgentGraph:
         await self._thought(state, thought2)
 
         # Update source_document_path so finalize_operations picks it up
+        # We must also extract the new structure so UIDs are stamped on the generated document
+        # and the DB gets the correct structure_json.
+        new_structure = self.processor.extract(document_path, state["document_type"])
+
         return {
             "source_document_path": str(document_path),
             "op_summaries": summaries,
+            "structure": new_structure,
             "thoughts": state["thoughts"] + [thought, thought2],
         }
 

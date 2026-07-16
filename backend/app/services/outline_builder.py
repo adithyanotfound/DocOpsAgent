@@ -40,7 +40,6 @@ class OutlineBuilder:
         dom_children = structure.get("dom", {}).get("children", [])
         blocks = structure.get("blocks", [])
 
-        sections: list[dict] = []
         indices: dict[str, Any] = {
             "tables_by_ordinal": {},
             "images_by_ordinal": {},
@@ -54,7 +53,6 @@ class OutlineBuilder:
         if not dom_children:
             return cls._build_docx_fallback(blocks)
 
-        # Pre-pass to populate index mappings and ordinal counts
         table_counter = 0
         image_counter = 0
         last_id = None
@@ -77,7 +75,6 @@ class OutlineBuilder:
             el_summary = {
                 "id": el_id,
                 "type": el_type,
-                "body_index": el.get("body_index"),
             }
 
             if el_type == "paragraph":
@@ -231,70 +228,90 @@ class OutlineBuilder:
         indices["all_elements"] = flat_elements
 
         # Group flat elements hierarchically into sections
-        current_section = {
-            "heading": "Document Start",
-            "heading_id": "start",
-            "semantic_type": "section",
-            "heading_level": 0,
-            "ordinal": 0,
-            "body_index_range": [0, 0],
-            "elements": [],
-        }
-        
-        section_counter = 0
-
-        for el in flat_elements:
-            # A heading marks a new section
+        headings_and_start = []
+        headings_and_start.append({
+            "idx": -1, 
+            "el": {"id": "start", "heading_level": 0, "text_preview": "Document Start", "role": "heading"}
+        })
+        for i, el in enumerate(flat_elements):
             if el.get("role") == "heading":
-                # Save previous section if it had content/elements
-                if current_section["elements"] or current_section["heading_id"] != "start":
-                    if current_section["elements"]:
-                        start_idx = current_section["elements"][0].get("body_index", 0)
-                        end_idx = current_section["elements"][-1].get("body_index", 0)
-                        current_section["body_index_range"] = [start_idx, end_idx]
-                    sections.append(current_section)
+                headings_and_start.append({"idx": i, "el": el})
+                
+        flat_sections = []
+        for i, h_info in enumerate(headings_and_start):
+            h_idx = h_info["idx"]
+            h_el = h_info["el"]
+            
+            # end_idx for flat (non-overlapping) elements
+            end_idx_flat = len(flat_elements) - 1
+            if i + 1 < len(headings_and_start):
+                end_idx_flat = headings_and_start[i + 1]["idx"] - 1
+            
+            start_elem = h_idx if h_idx >= 0 else 0
+            section_elements = flat_elements[start_elem:end_idx_flat + 1] if start_elem <= end_idx_flat else []
+            
+            # end_idx for the HIERARCHICAL section (same or higher level)
+            end_idx_hier = len(flat_elements) - 1
+            for j in range(i + 1, len(headings_and_start)):
+                if headings_and_start[j]["el"].get("heading_level", 1) <= h_el.get("heading_level", 0):
+                    end_idx_hier = headings_and_start[j]["idx"] - 1
+                    break
+            
+            section_elements_hier = flat_elements[start_elem:end_idx_hier + 1] if start_elem <= end_idx_hier else []
+            
+            # Boundary conditions:
+            # - If section_elements_hier is empty, start_id == end_id == heading_id
+            # - If it's the last section, end_id will automatically be the last element's id
+            hier_start_id = section_elements_hier[0]["id"] if section_elements_hier else h_el["id"]
+            hier_end_id = section_elements_hier[-1]["id"] if section_elements_hier else h_el["id"]
+            
+            is_toc = False
+            text = h_el.get("text_preview", "")
+            if h_el["id"] != "start":
+                is_toc = "table of contents" in text.lower() or "contents" in text.lower() or "toc" == text.lower().strip()
+                
+            sec = {
+                "heading": text,
+                "heading_id": h_el["id"],
+                "semantic_type": "toc" if is_toc else "section",
+                "heading_level": h_el.get("heading_level", 0),
+                "ordinal": i,
+                "elements": section_elements,
+                "section_start_id": hier_start_id,
+                "section_end_id": hier_end_id,
+                "child_sections": []
+            }
+            if section_elements or h_el["id"] != "start":
+                flat_sections.append(sec)
 
-                # Heuristic: detect TOC section
-                text = el.get("text_preview", "")
-                is_toc = False
-                if "table of contents" in text.lower() or "contents" in text.lower() or "toc" == text.lower().strip():
-                    is_toc = True
-
-                section_counter += 1
-                current_section = {
-                    "heading": text,
-                    "heading_id": el["id"],
-                    "semantic_type": "toc" if is_toc else "section",
-                    "heading_level": el.get("heading_level", 1),
-                    "ordinal": section_counter,
-                    "body_index_range": [el.get("body_index", 0), el.get("body_index", 0)],
-                    "elements": [el],
-                }
+        # Build child_sections tree
+        stack = []
+        tree_sections = []
+        for sec in flat_sections:
+            while stack and stack[-1]["heading_level"] >= sec["heading_level"]:
+                stack.pop()
+            
+            if stack:
+                stack[-1]["child_sections"].append(sec)
             else:
-                current_section["elements"].append(el)
-
-        # Append last section
-        if current_section["elements"] or current_section["heading_id"] != "start":
-            if current_section["elements"]:
-                start_idx = current_section["elements"][0].get("body_index", 0)
-                end_idx = current_section["elements"][-1].get("body_index", 0)
-                current_section["body_index_range"] = [start_idx, end_idx]
-            sections.append(current_section)
+                tree_sections.append(sec)
+            stack.append(sec)
 
         # Document title is inferred from first section heading
         title = "Untitled Document"
-        if sections and len(sections) > 0:
-            first_sect = sections[0]
+        if flat_sections and len(flat_sections) > 0:
+            first_sect = flat_sections[0]
             if first_sect["heading_id"] != "start":
                 title = first_sect["heading"]
-            elif len(sections) > 1:
-                title = sections[1]["heading"]
+            elif len(flat_sections) > 1:
+                title = flat_sections[1]["heading"]
 
         return {
             "document_type": "docx",
             "title": title,
             "element_count": len(flat_elements),
-            "sections": sections,
+            "sections": flat_sections,
+            "tree_sections": tree_sections,
             "indices": {
                 "tables_by_ordinal": indices["tables_by_ordinal"],
                 "images_by_ordinal": indices["images_by_ordinal"],
@@ -361,8 +378,10 @@ class OutlineBuilder:
             "semantic_type": "section",
             "heading_level": 0,
             "ordinal": 1,
-            "body_index_range": [0, len(flat_elements)],
             "elements": flat_elements,
+            "section_start_id": first_id if first_id else "body",
+            "section_end_id": last_id if last_id else "body",
+            "child_sections": [],
         }]
 
         return {

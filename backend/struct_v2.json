@@ -1,0 +1,1363 @@
+Version: 2
+{
+  "document_type": "docx",
+  "dom": {
+    "id": "document_root",
+    "type": "document",
+    "children": [
+      {
+        "id": "metadata",
+        "type": "metadata",
+        "role": "metadata",
+        "properties": {
+          "title": "",
+          "author": "python-docx",
+          "subject": "",
+          "keywords": ""
+        }
+      },
+      {
+        "id": "section_0",
+        "type": "section",
+        "role": "section",
+        "style": {
+          "orientation": "PORTRAIT",
+          "page_width_inches": 8.5,
+          "page_height_inches": 11.0,
+          "top_margin_inches": 1.0,
+          "bottom_margin_inches": 1.0,
+          "left_margin_inches": 1.25,
+          "right_margin_inches": 1.25
+        }
+      },
+      {
+        "id": "paragraph_1",
+        "body_index": 0,
+        "type": "paragraph",
+        "role": "body",
+        "text": "Business Report Template",
+        "style": {
+          "style_name": "Title",
+          "alignment": "center",
+          "line_spacing": null,
+          "page_break_before": null,
+          "space_before_pt": null,
+          "space_after_pt": null
+        },
+        "runs": [
+          {
+            "id": "paragraph_1_run_0",
+            "type": "run",
+            "text": "Business Report Template",
+            "style": {
+              "font": null,
+              "size": 26.0,
+              "bold": null,
+              "italic": null,
+              "underline": null,
+              "strike": null,
+              "highlight": null,
+              "color": "17365D"
+            }
+          }
+        ]
+      },
+      {
+        "id": "paragraph_2",
+        "body_index": 1,
+        "type": "paragraph",
+        "role": "heading",
+        "text": "Executive Summary",
+        "style": {
+          "style_name": "Heading 1",
+          "alignment": null,
+          "line_spacing": null,
+          "page_break_before": null,
+          "space_before_pt": null,
+          "space_after_pt": null
+        },
+        "runs": [
+          {
+            "id": "paragraph_2_run_0",
+            "type": "run",
+            "text": "Executive Summary",
+            "style": {
+              "font": null,
+              "size": 14.0,
+              "bold": null,
+              "italic": null,
+              "underline": null,
+              "strike": null,
+              "highlight": null,
+              "color": "365F91"
+            }
+          }
+        ],
+        "include_in_toc": true,
+        "heading_level": 1
+      },
+      {
+        "id": "paragraph_3",
+        "body_index": 2,
+        "type": "paragraph",
+        "role": "body",
+        "text": "[Replace this placeholder with generated content.]",
+        "style": {
+          "style_name": "Normal",
+          "alignment": null,
+          "line_spacing": null,
+          "page_break_before": null,
+          "space_before_pt": null,
+          "space_after_pt": null
+        },
+        "runs": [
+          {
+            "id": "paragraph_3_run_0",
+            "type": "run",
+            "text": "[Replace this placeholder with generated content.]",
+            "style": {
+              "font": null,
+              "size": null,
+              "bold": null,
+              "italic": true,
+              "underline": null,
+              "strike": null,
+              "highlight": null,
+              "color": null
+            }
+          }
+        ]
+      },
+      {
+        "id": "paragraph_4",
+        "body_index": 3,
+        "type": "paragraph",
+        "role": "heading",
+        "text": "Company Overview",
+        "style": {
+          "style_name": "Heading 1",
+          "alignment": null,
+          "line_spacing": null,
+          "page_break_before": null,
+          "space_before_pt": null,
+          "space_after_pt": null
+        },
+        "runs": [
+          {
+            "id": "paragraph_4_run_0",
+            "type": "run",
+            "text": "Company Overview",
+            "style": {
+              "font": null,
+              "size": 14.0,
+              "bold": null,
+              "italic": null,
+              "underline": null,
+              "strike": null,
+              "highlight": null,
+              "color": "365F91"
+            }
+          }
+        ],
+        "include_in_toc": true,
+        "heading_level": 1
+      },
+      {
+        "id": "paragraph_5",
+        "body_index": 4,
+        "type": "paragraph",
+        "role": "body",
+        "text": "[Replace this placeholder with generated content.]",
+        "style": {
+          "style_name": "Normal",
+          "alignment": null,
+          "line_spacing": null,
+          "page_break_before": null,
+          "space_before_pt": null,
+          "space_after_pt": null
+        },
+        "runs": [
+          {
+            "id": "paragraph_5_run_0",
+            "type": "run",
+            "text": "[Replace this placeholder with generated content.]",
+            "style": {
+              "font": null,
+              "size": null,
+              "bold": null,
+              "italic": true,
+              "underline": null,
+              "strike": null,
+              "highlight": null,
+              "color": null
+            }
+          }
+        ]
+      },
+      {
+        "id": "paragraph_6",
+        "body_index": 5,
+        "type": "paragraph",
+        "role": "heading",
+        "text": "Business Objectives",
+        "style": {
+          "style_name": "Heading 1",
+          "alignment": null,
+          "line_spacing": null,
+          "page_break_before": null,
+          "space_before_pt": null,
+          "space_after_pt": null
+        },
+        "runs": [
+          {
+            "id": "paragraph_6_run_0",
+            "type": "run",
+            "text": "Business Objectives",
+            "style": {
+              "font": null,
+              "size": 14.0,
+              "bold": null,
+              "italic": null,
+              "underline": null,
+              "strike": null,
+              "highlight": null,
+              "color": "365F91"
+            }
+          }
+        ],
+        "include_in_toc": true,
+        "heading_level": 1
+      },
+      {
+        "id": "paragraph_7",
+        "body_index": 6,
+        "type": "paragraph",
+        "role": "body",
+        "text": "[Replace this placeholder with generated content.]",
+        "style": {
+          "style_name": "Normal",
+          "alignment": null,
+          "line_spacing": null,
+          "page_break_before": null,
+          "space_before_pt": null,
+          "space_after_pt": null
+        },
+        "runs": [
+          {
+            "id": "paragraph_7_run_0",
+            "type": "run",
+            "text": "[Replace this placeholder with generated content.]",
+            "style": {
+              "font": null,
+              "size": null,
+              "bold": null,
+              "italic": true,
+              "underline": null,
+              "strike": null,
+              "highlight": null,
+              "color": null
+            }
+          }
+        ]
+      },
+      {
+        "id": "paragraph_8",
+        "body_index": 7,
+        "type": "paragraph",
+        "role": "heading",
+        "text": "Financial Highlights",
+        "style": {
+          "style_name": "Heading 1",
+          "alignment": null,
+          "line_spacing": null,
+          "page_break_before": null,
+          "space_before_pt": null,
+          "space_after_pt": null
+        },
+        "runs": [
+          {
+            "id": "paragraph_8_run_0",
+            "type": "run",
+            "text": "Financial Highlights",
+            "style": {
+              "font": null,
+              "size": 14.0,
+              "bold": null,
+              "italic": null,
+              "underline": null,
+              "strike": null,
+              "highlight": null,
+              "color": "365F91"
+            }
+          }
+        ],
+        "include_in_toc": true,
+        "heading_level": 1
+      },
+      {
+        "id": "paragraph_9",
+        "body_index": 8,
+        "type": "paragraph",
+        "role": "body",
+        "text": "[Replace this placeholder with generated content.]",
+        "style": {
+          "style_name": "Normal",
+          "alignment": null,
+          "line_spacing": null,
+          "page_break_before": null,
+          "space_before_pt": null,
+          "space_after_pt": null
+        },
+        "runs": [
+          {
+            "id": "paragraph_9_run_0",
+            "type": "run",
+            "text": "[Replace this placeholder with generated content.]",
+            "style": {
+              "font": null,
+              "size": null,
+              "bold": null,
+              "italic": true,
+              "underline": null,
+              "strike": null,
+              "highlight": null,
+              "color": null
+            }
+          }
+        ]
+      },
+      {
+        "id": "paragraph_10",
+        "body_index": 9,
+        "type": "paragraph",
+        "role": "heading",
+        "text": "Operational Performance",
+        "style": {
+          "style_name": "Heading 1",
+          "alignment": null,
+          "line_spacing": null,
+          "page_break_before": null,
+          "space_before_pt": null,
+          "space_after_pt": null
+        },
+        "runs": [
+          {
+            "id": "paragraph_10_run_0",
+            "type": "run",
+            "text": "Operational Performance",
+            "style": {
+              "font": null,
+              "size": 14.0,
+              "bold": null,
+              "italic": null,
+              "underline": null,
+              "strike": null,
+              "highlight": null,
+              "color": "365F91"
+            }
+          }
+        ],
+        "include_in_toc": true,
+        "heading_level": 1
+      },
+      {
+        "id": "paragraph_11",
+        "body_index": 10,
+        "type": "paragraph",
+        "role": "body",
+        "text": "[Replace this placeholder with generated content.]",
+        "style": {
+          "style_name": "Normal",
+          "alignment": null,
+          "line_spacing": null,
+          "page_break_before": null,
+          "space_before_pt": null,
+          "space_after_pt": null
+        },
+        "runs": [
+          {
+            "id": "paragraph_11_run_0",
+            "type": "run",
+            "text": "[Replace this placeholder with generated content.]",
+            "style": {
+              "font": null,
+              "size": null,
+              "bold": null,
+              "italic": true,
+              "underline": null,
+              "strike": null,
+              "highlight": null,
+              "color": null
+            }
+          }
+        ]
+      },
+      {
+        "id": "paragraph_12",
+        "body_index": 11,
+        "type": "paragraph",
+        "role": "heading",
+        "text": "Customer Insights",
+        "style": {
+          "style_name": "Heading 1",
+          "alignment": null,
+          "line_spacing": null,
+          "page_break_before": null,
+          "space_before_pt": null,
+          "space_after_pt": null
+        },
+        "runs": [
+          {
+            "id": "paragraph_12_run_0",
+            "type": "run",
+            "text": "Customer Insights",
+            "style": {
+              "font": null,
+              "size": 14.0,
+              "bold": null,
+              "italic": null,
+              "underline": null,
+              "strike": null,
+              "highlight": null,
+              "color": "365F91"
+            }
+          }
+        ],
+        "include_in_toc": true,
+        "heading_level": 1
+      },
+      {
+        "id": "paragraph_13",
+        "body_index": 12,
+        "type": "paragraph",
+        "role": "body",
+        "text": "[Replace this placeholder with generated content.]",
+        "style": {
+          "style_name": "Normal",
+          "alignment": null,
+          "line_spacing": null,
+          "page_break_before": null,
+          "space_before_pt": null,
+          "space_after_pt": null
+        },
+        "runs": [
+          {
+            "id": "paragraph_13_run_0",
+            "type": "run",
+            "text": "[Replace this placeholder with generated content.]",
+            "style": {
+              "font": null,
+              "size": null,
+              "bold": null,
+              "italic": true,
+              "underline": null,
+              "strike": null,
+              "highlight": null,
+              "color": null
+            }
+          }
+        ]
+      },
+      {
+        "id": "paragraph_14",
+        "body_index": 13,
+        "type": "paragraph",
+        "role": "heading",
+        "text": "Risk Assessment",
+        "style": {
+          "style_name": "Heading 1",
+          "alignment": null,
+          "line_spacing": null,
+          "page_break_before": null,
+          "space_before_pt": null,
+          "space_after_pt": null
+        },
+        "runs": [
+          {
+            "id": "paragraph_14_run_0",
+            "type": "run",
+            "text": "Risk Assessment",
+            "style": {
+              "font": null,
+              "size": 14.0,
+              "bold": null,
+              "italic": null,
+              "underline": null,
+              "strike": null,
+              "highlight": null,
+              "color": "365F91"
+            }
+          }
+        ],
+        "include_in_toc": true,
+        "heading_level": 1
+      },
+      {
+        "id": "paragraph_15",
+        "body_index": 14,
+        "type": "paragraph",
+        "role": "body",
+        "text": "[Replace this placeholder with generated content.]",
+        "style": {
+          "style_name": "Normal",
+          "alignment": null,
+          "line_spacing": null,
+          "page_break_before": null,
+          "space_before_pt": null,
+          "space_after_pt": null
+        },
+        "runs": [
+          {
+            "id": "paragraph_15_run_0",
+            "type": "run",
+            "text": "[Replace this placeholder with generated content.]",
+            "style": {
+              "font": null,
+              "size": null,
+              "bold": null,
+              "italic": true,
+              "underline": null,
+              "strike": null,
+              "highlight": null,
+              "color": null
+            }
+          }
+        ]
+      },
+      {
+        "id": "paragraph_16",
+        "body_index": 15,
+        "type": "paragraph",
+        "role": "heading",
+        "text": "Recommendations",
+        "style": {
+          "style_name": "Heading 1",
+          "alignment": null,
+          "line_spacing": null,
+          "page_break_before": null,
+          "space_before_pt": null,
+          "space_after_pt": null
+        },
+        "runs": [
+          {
+            "id": "paragraph_16_run_0",
+            "type": "run",
+            "text": "Recommendations",
+            "style": {
+              "font": null,
+              "size": 14.0,
+              "bold": null,
+              "italic": null,
+              "underline": null,
+              "strike": null,
+              "highlight": null,
+              "color": "365F91"
+            }
+          }
+        ],
+        "include_in_toc": true,
+        "heading_level": 1
+      },
+      {
+        "id": "paragraph_17",
+        "body_index": 16,
+        "type": "paragraph",
+        "role": "body",
+        "text": "[Replace this placeholder with generated content.]",
+        "style": {
+          "style_name": "Normal",
+          "alignment": null,
+          "line_spacing": null,
+          "page_break_before": null,
+          "space_before_pt": null,
+          "space_after_pt": null
+        },
+        "runs": [
+          {
+            "id": "paragraph_17_run_0",
+            "type": "run",
+            "text": "[Replace this placeholder with generated content.]",
+            "style": {
+              "font": null,
+              "size": null,
+              "bold": null,
+              "italic": true,
+              "underline": null,
+              "strike": null,
+              "highlight": null,
+              "color": null
+            }
+          }
+        ]
+      },
+      {
+        "id": "paragraph_18",
+        "body_index": 17,
+        "type": "paragraph",
+        "role": "heading",
+        "text": "Conclusion",
+        "style": {
+          "style_name": "Heading 1",
+          "alignment": null,
+          "line_spacing": null,
+          "page_break_before": null,
+          "space_before_pt": null,
+          "space_after_pt": null
+        },
+        "runs": [
+          {
+            "id": "paragraph_18_run_0",
+            "type": "run",
+            "text": "Conclusion",
+            "style": {
+              "font": null,
+              "size": 14.0,
+              "bold": null,
+              "italic": null,
+              "underline": null,
+              "strike": null,
+              "highlight": null,
+              "color": "365F91"
+            }
+          }
+        ],
+        "include_in_toc": true,
+        "heading_level": 1
+      },
+      {
+        "id": "paragraph_19",
+        "body_index": 18,
+        "type": "paragraph",
+        "role": "body",
+        "text": "[Replace this placeholder with generated content.]",
+        "style": {
+          "style_name": "Normal",
+          "alignment": null,
+          "line_spacing": null,
+          "page_break_before": null,
+          "space_before_pt": null,
+          "space_after_pt": null
+        },
+        "runs": [
+          {
+            "id": "paragraph_19_run_0",
+            "type": "run",
+            "text": "[Replace this placeholder with generated content.]",
+            "style": {
+              "font": null,
+              "size": null,
+              "bold": null,
+              "italic": true,
+              "underline": null,
+              "strike": null,
+              "highlight": null,
+              "color": null
+            }
+          }
+        ]
+      },
+      {
+        "id": "paragraph_20",
+        "body_index": 19,
+        "type": "paragraph",
+        "role": "heading",
+        "text": "Key Metrics",
+        "style": {
+          "style_name": "Heading 1",
+          "alignment": null,
+          "line_spacing": null,
+          "page_break_before": null,
+          "space_before_pt": null,
+          "space_after_pt": null
+        },
+        "runs": [
+          {
+            "id": "paragraph_20_run_0",
+            "type": "run",
+            "text": "Key Metrics",
+            "style": {
+              "font": null,
+              "size": 14.0,
+              "bold": null,
+              "italic": null,
+              "underline": null,
+              "strike": null,
+              "highlight": null,
+              "color": "365F91"
+            }
+          }
+        ],
+        "include_in_toc": true,
+        "heading_level": 1
+      },
+      {
+        "id": "table_1",
+        "body_index": 20,
+        "type": "table",
+        "role": "table",
+        "style": {
+          "style_name": "Normal Table"
+        },
+        "row_count": 2,
+        "col_count": 4,
+        "rows": [
+          {
+            "id": "table_1_row_0",
+            "type": "row",
+            "row": 0,
+            "cells": [
+              {
+                "id": "table_1_cell_0_0",
+                "type": "cell",
+                "row": 0,
+                "column": 0,
+                "children": [
+                  {
+                    "id": "table_1_cell_0_0_para_0",
+                    "type": "paragraph",
+                    "role": "table_cell_paragraph",
+                    "text": "Metric",
+                    "style": {
+                      "alignment": null,
+                      "line_spacing": null,
+                      "page_break_before": null,
+                      "space_before_pt": null,
+                      "space_after_pt": null
+                    },
+                    "runs": [
+                      {
+                        "id": "table_1_cell_0_0_para_0_run_0",
+                        "type": "run",
+                        "text": "Metric",
+                        "style": {
+                          "font": null,
+                          "size": null,
+                          "bold": null,
+                          "italic": null,
+                          "underline": null,
+                          "strike": null,
+                          "highlight": null,
+                          "color": null
+                        }
+                      }
+                    ]
+                  }
+                ]
+              },
+              {
+                "id": "table_1_cell_0_1",
+                "type": "cell",
+                "row": 0,
+                "column": 1,
+                "children": [
+                  {
+                    "id": "table_1_cell_0_1_para_0",
+                    "type": "paragraph",
+                    "role": "table_cell_paragraph",
+                    "text": "Current",
+                    "style": {
+                      "alignment": null,
+                      "line_spacing": null,
+                      "page_break_before": null,
+                      "space_before_pt": null,
+                      "space_after_pt": null
+                    },
+                    "runs": [
+                      {
+                        "id": "table_1_cell_0_1_para_0_run_0",
+                        "type": "run",
+                        "text": "Current",
+                        "style": {
+                          "font": null,
+                          "size": null,
+                          "bold": null,
+                          "italic": null,
+                          "underline": null,
+                          "strike": null,
+                          "highlight": null,
+                          "color": null
+                        }
+                      }
+                    ]
+                  }
+                ]
+              },
+              {
+                "id": "table_1_cell_0_2",
+                "type": "cell",
+                "row": 0,
+                "column": 2,
+                "children": [
+                  {
+                    "id": "table_1_cell_0_2_para_0",
+                    "type": "paragraph",
+                    "role": "table_cell_paragraph",
+                    "text": "Previous",
+                    "style": {
+                      "alignment": null,
+                      "line_spacing": null,
+                      "page_break_before": null,
+                      "space_before_pt": null,
+                      "space_after_pt": null
+                    },
+                    "runs": [
+                      {
+                        "id": "table_1_cell_0_2_para_0_run_0",
+                        "type": "run",
+                        "text": "Previous",
+                        "style": {
+                          "font": null,
+                          "size": null,
+                          "bold": null,
+                          "italic": null,
+                          "underline": null,
+                          "strike": null,
+                          "highlight": null,
+                          "color": null
+                        }
+                      }
+                    ]
+                  }
+                ]
+              },
+              {
+                "id": "table_1_cell_0_3",
+                "type": "cell",
+                "row": 0,
+                "column": 3,
+                "children": [
+                  {
+                    "id": "table_1_cell_0_3_para_0",
+                    "type": "paragraph",
+                    "role": "table_cell_paragraph",
+                    "text": "Notes",
+                    "style": {
+                      "alignment": null,
+                      "line_spacing": null,
+                      "page_break_before": null,
+                      "space_before_pt": null,
+                      "space_after_pt": null
+                    },
+                    "runs": [
+                      {
+                        "id": "table_1_cell_0_3_para_0_run_0",
+                        "type": "run",
+                        "text": "Notes",
+                        "style": {
+                          "font": null,
+                          "size": null,
+                          "bold": null,
+                          "italic": null,
+                          "underline": null,
+                          "strike": null,
+                          "highlight": null,
+                          "color": null
+                        }
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "id": "table_1_row_1",
+            "type": "row",
+            "row": 1,
+            "cells": [
+              {
+                "id": "table_1_cell_1_0",
+                "type": "cell",
+                "row": 1,
+                "column": 0,
+                "children": [
+                  {
+                    "id": "table_1_cell_1_0_para_0",
+                    "type": "paragraph",
+                    "role": "table_cell_paragraph",
+                    "text": "[Data]",
+                    "style": {
+                      "alignment": null,
+                      "line_spacing": null,
+                      "page_break_before": null,
+                      "space_before_pt": null,
+                      "space_after_pt": null
+                    },
+                    "runs": [
+                      {
+                        "id": "table_1_cell_1_0_para_0_run_0",
+                        "type": "run",
+                        "text": "[Data]",
+                        "style": {
+                          "font": null,
+                          "size": null,
+                          "bold": null,
+                          "italic": null,
+                          "underline": null,
+                          "strike": null,
+                          "highlight": null,
+                          "color": null
+                        }
+                      }
+                    ]
+                  }
+                ]
+              },
+              {
+                "id": "table_1_cell_1_1",
+                "type": "cell",
+                "row": 1,
+                "column": 1,
+                "children": [
+                  {
+                    "id": "table_1_cell_1_1_para_0",
+                    "type": "paragraph",
+                    "role": "table_cell_paragraph",
+                    "text": "[Data]",
+                    "style": {
+                      "alignment": null,
+                      "line_spacing": null,
+                      "page_break_before": null,
+                      "space_before_pt": null,
+                      "space_after_pt": null
+                    },
+                    "runs": [
+                      {
+                        "id": "table_1_cell_1_1_para_0_run_0",
+                        "type": "run",
+                        "text": "[Data]",
+                        "style": {
+                          "font": null,
+                          "size": null,
+                          "bold": null,
+                          "italic": null,
+                          "underline": null,
+                          "strike": null,
+                          "highlight": null,
+                          "color": null
+                        }
+                      }
+                    ]
+                  }
+                ]
+              },
+              {
+                "id": "table_1_cell_1_2",
+                "type": "cell",
+                "row": 1,
+                "column": 2,
+                "children": [
+                  {
+                    "id": "table_1_cell_1_2_para_0",
+                    "type": "paragraph",
+                    "role": "table_cell_paragraph",
+                    "text": "[Data]",
+                    "style": {
+                      "alignment": null,
+                      "line_spacing": null,
+                      "page_break_before": null,
+                      "space_before_pt": null,
+                      "space_after_pt": null
+                    },
+                    "runs": [
+                      {
+                        "id": "table_1_cell_1_2_para_0_run_0",
+                        "type": "run",
+                        "text": "[Data]",
+                        "style": {
+                          "font": null,
+                          "size": null,
+                          "bold": null,
+                          "italic": null,
+                          "underline": null,
+                          "strike": null,
+                          "highlight": null,
+                          "color": null
+                        }
+                      }
+                    ]
+                  }
+                ]
+              },
+              {
+                "id": "table_1_cell_1_3",
+                "type": "cell",
+                "row": 1,
+                "column": 3,
+                "children": [
+                  {
+                    "id": "table_1_cell_1_3_para_0",
+                    "type": "paragraph",
+                    "role": "table_cell_paragraph",
+                    "text": "[Data]",
+                    "style": {
+                      "alignment": null,
+                      "line_spacing": null,
+                      "page_break_before": null,
+                      "space_before_pt": null,
+                      "space_after_pt": null
+                    },
+                    "runs": [
+                      {
+                        "id": "table_1_cell_1_3_para_0_run_0",
+                        "type": "run",
+                        "text": "[Data]",
+                        "style": {
+                          "font": null,
+                          "size": null,
+                          "bold": null,
+                          "italic": null,
+                          "underline": null,
+                          "strike": null,
+                          "highlight": null,
+                          "color": null
+                        }
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "blocks": [
+    {
+      "element_id": "paragraph_1",
+      "text": "Business Report Template",
+      "type": "text",
+      "metadata": {
+        "role": "body",
+        "colors": [
+          "17365D"
+        ],
+        "fonts": [],
+        "include_in_toc": null
+      }
+    },
+    {
+      "element_id": "paragraph_2",
+      "text": "Executive Summary",
+      "type": "text",
+      "metadata": {
+        "role": "heading",
+        "colors": [
+          "365F91"
+        ],
+        "fonts": [],
+        "include_in_toc": true
+      }
+    },
+    {
+      "element_id": "paragraph_3",
+      "text": "[Replace this placeholder with generated content.]",
+      "type": "text",
+      "metadata": {
+        "role": "body",
+        "colors": [],
+        "fonts": [],
+        "include_in_toc": null
+      }
+    },
+    {
+      "element_id": "paragraph_4",
+      "text": "Company Overview",
+      "type": "text",
+      "metadata": {
+        "role": "heading",
+        "colors": [
+          "365F91"
+        ],
+        "fonts": [],
+        "include_in_toc": true
+      }
+    },
+    {
+      "element_id": "paragraph_5",
+      "text": "[Replace this placeholder with generated content.]",
+      "type": "text",
+      "metadata": {
+        "role": "body",
+        "colors": [],
+        "fonts": [],
+        "include_in_toc": null
+      }
+    },
+    {
+      "element_id": "paragraph_6",
+      "text": "Business Objectives",
+      "type": "text",
+      "metadata": {
+        "role": "heading",
+        "colors": [
+          "365F91"
+        ],
+        "fonts": [],
+        "include_in_toc": true
+      }
+    },
+    {
+      "element_id": "paragraph_7",
+      "text": "[Replace this placeholder with generated content.]",
+      "type": "text",
+      "metadata": {
+        "role": "body",
+        "colors": [],
+        "fonts": [],
+        "include_in_toc": null
+      }
+    },
+    {
+      "element_id": "paragraph_8",
+      "text": "Financial Highlights",
+      "type": "text",
+      "metadata": {
+        "role": "heading",
+        "colors": [
+          "365F91"
+        ],
+        "fonts": [],
+        "include_in_toc": true
+      }
+    },
+    {
+      "element_id": "paragraph_9",
+      "text": "[Replace this placeholder with generated content.]",
+      "type": "text",
+      "metadata": {
+        "role": "body",
+        "colors": [],
+        "fonts": [],
+        "include_in_toc": null
+      }
+    },
+    {
+      "element_id": "paragraph_10",
+      "text": "Operational Performance",
+      "type": "text",
+      "metadata": {
+        "role": "heading",
+        "colors": [
+          "365F91"
+        ],
+        "fonts": [],
+        "include_in_toc": true
+      }
+    },
+    {
+      "element_id": "paragraph_11",
+      "text": "[Replace this placeholder with generated content.]",
+      "type": "text",
+      "metadata": {
+        "role": "body",
+        "colors": [],
+        "fonts": [],
+        "include_in_toc": null
+      }
+    },
+    {
+      "element_id": "paragraph_12",
+      "text": "Customer Insights",
+      "type": "text",
+      "metadata": {
+        "role": "heading",
+        "colors": [
+          "365F91"
+        ],
+        "fonts": [],
+        "include_in_toc": true
+      }
+    },
+    {
+      "element_id": "paragraph_13",
+      "text": "[Replace this placeholder with generated content.]",
+      "type": "text",
+      "metadata": {
+        "role": "body",
+        "colors": [],
+        "fonts": [],
+        "include_in_toc": null
+      }
+    },
+    {
+      "element_id": "paragraph_14",
+      "text": "Risk Assessment",
+      "type": "text",
+      "metadata": {
+        "role": "heading",
+        "colors": [
+          "365F91"
+        ],
+        "fonts": [],
+        "include_in_toc": true
+      }
+    },
+    {
+      "element_id": "paragraph_15",
+      "text": "[Replace this placeholder with generated content.]",
+      "type": "text",
+      "metadata": {
+        "role": "body",
+        "colors": [],
+        "fonts": [],
+        "include_in_toc": null
+      }
+    },
+    {
+      "element_id": "paragraph_16",
+      "text": "Recommendations",
+      "type": "text",
+      "metadata": {
+        "role": "heading",
+        "colors": [
+          "365F91"
+        ],
+        "fonts": [],
+        "include_in_toc": true
+      }
+    },
+    {
+      "element_id": "paragraph_17",
+      "text": "[Replace this placeholder with generated content.]",
+      "type": "text",
+      "metadata": {
+        "role": "body",
+        "colors": [],
+        "fonts": [],
+        "include_in_toc": null
+      }
+    },
+    {
+      "element_id": "paragraph_18",
+      "text": "Conclusion",
+      "type": "text",
+      "metadata": {
+        "role": "heading",
+        "colors": [
+          "365F91"
+        ],
+        "fonts": [],
+        "include_in_toc": true
+      }
+    },
+    {
+      "element_id": "paragraph_19",
+      "text": "[Replace this placeholder with generated content.]",
+      "type": "text",
+      "metadata": {
+        "role": "body",
+        "colors": [],
+        "fonts": [],
+        "include_in_toc": null
+      }
+    },
+    {
+      "element_id": "paragraph_20",
+      "text": "Key Metrics",
+      "type": "text",
+      "metadata": {
+        "role": "heading",
+        "colors": [
+          "365F91"
+        ],
+        "fonts": [],
+        "include_in_toc": true
+      }
+    },
+    {
+      "element_id": "table_1_cell_0_0_para_0",
+      "text": "Metric",
+      "type": "text",
+      "metadata": {
+        "role": "table_cell_paragraph",
+        "colors": [],
+        "fonts": [],
+        "include_in_toc": null
+      }
+    },
+    {
+      "element_id": "table_1_cell_0_1_para_0",
+      "text": "Current",
+      "type": "text",
+      "metadata": {
+        "role": "table_cell_paragraph",
+        "colors": [],
+        "fonts": [],
+        "include_in_toc": null
+      }
+    },
+    {
+      "element_id": "table_1_cell_0_2_para_0",
+      "text": "Previous",
+      "type": "text",
+      "metadata": {
+        "role": "table_cell_paragraph",
+        "colors": [],
+        "fonts": [],
+        "include_in_toc": null
+      }
+    },
+    {
+      "element_id": "table_1_cell_0_3_para_0",
+      "text": "Notes",
+      "type": "text",
+      "metadata": {
+        "role": "table_cell_paragraph",
+        "colors": [],
+        "fonts": [],
+        "include_in_toc": null
+      }
+    },
+    {
+      "element_id": "table_1_cell_1_0_para_0",
+      "text": "[Data]",
+      "type": "text",
+      "metadata": {
+        "role": "table_cell_paragraph",
+        "colors": [],
+        "fonts": [],
+        "include_in_toc": null
+      }
+    },
+    {
+      "element_id": "table_1_cell_1_1_para_0",
+      "text": "[Data]",
+      "type": "text",
+      "metadata": {
+        "role": "table_cell_paragraph",
+        "colors": [],
+        "fonts": [],
+        "include_in_toc": null
+      }
+    },
+    {
+      "element_id": "table_1_cell_1_2_para_0",
+      "text": "[Data]",
+      "type": "text",
+      "metadata": {
+        "role": "table_cell_paragraph",
+        "colors": [],
+        "fonts": [],
+        "include_in_toc": null
+      }
+    },
+    {
+      "element_id": "table_1_cell_1_3_para_0",
+      "text": "[Data]",
+      "type": "text",
+      "metadata": {
+        "role": "table_cell_paragraph",
+        "colors": [],
+        "fonts": [],
+        "include_in_toc": null
+      }
+    }
+  ],
+  "analysis": {
+    "purpose": "Marketing Report",
+    "theme": "Formal",
+    "summary": "The document appears to be a comprehensive marketing report that analyzes current market trends, consumer behavior, and the effectiveness of recent marketing strategies. It likely aims to provide insights and recommendations for future marketing initiatives to enhance brand visibility and sales performance."
+  }
+}

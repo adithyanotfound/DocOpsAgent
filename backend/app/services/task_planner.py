@@ -22,7 +22,7 @@ Available task types:
 - text_format: Change formatting (font family/name, font style, bold, color, size, alignment, margins, spacing, bullets, etc.)
 - table_op: Create, modify, or delete tables, columns, rows, or cell contents/styling
 - image_op: Insert, replace, resize, style, reposition, or remove images
-- layout_op: Move sections, insert page breaks, add/remove sections, add/remove Table of Contents (TOC)
+- layout_op: Move sections, swap sections, insert page breaks, add/remove sections, add/remove Table of Contents (TOC)
 - list_op: Convert list formats (bullets, numbered, checklist), add list items, sort lists
 - find_replace: Global text find and replace across the document
 - theme_op: Slide/page background, margin settings, corporate themes, color palettes
@@ -57,6 +57,11 @@ CRITICAL RULES:
    - Metadata: modify document properties (Title, Author, Subject, Keywords).
    - Headers/Footers: edit contents within headers and footers just like normal body text.
 9. DO NOT invent unsupported tasks (e.g., floating images, rounded corners, drop shadows). For aesthetic requests (e.g., "make it modern"), creatively combine the SUPPORTED properties (like changing heading fonts to sans-serif, using elegant dark gray colors, adjusting page layout, and adding paragraph spacing).
+10. INSERTING CONTENT INTO/AFTER A SECTION: When the user says "insert N paragraphs/sections after [Section X]" or "add content below [Section X]", emit exactly ONE layout_op task — not one task per paragraph. The description must say how many items to insert and what topics. Example: "Insert 3 paragraphs after Executive Summary covering sustainability, AI, and employee development". The target_hint must reference the section, e.g., "after Executive Summary section".
+11. SWAPPING SECTIONS: When the user asks to "swap", "exchange", or "switch" two sections, emit ONE layout_op task. The description should be "Swap [Section A] and [Section B] sections". The target_hint should name both sections, e.g., "Action Items and Key Metrics sections".
+12. SECTION INSERTION HINT FORMAT: For target_hint when inserting content after a section, always use the pattern "after [Section Name] section" (e.g., "after Executive Summary section"). This tells the resolver to use the end of the section — after all existing content — as the insertion anchor.
+13. MOVING SECTIONS (DISTINCT FROM SWAPPING): When the user says "move [Section X] above [Section Y]", "move [Section X] before [Section Y]", "move [Section X] below [Section Y]", or "move [Section X] after [Section Y]", this is a MOVE, not a swap. Emit ONE layout_op task with description "Move [Section X] section above/below [Section Y] section". The target_hint MUST use the pattern "[Section X] above [Section Y]" or "[Section X] below [Section Y]" (e.g., "Action Items above Highlights", "Company Overview below Business Objectives"). NEVER use "swap" for move requests — swap exchanges both sections, move only relocates one.
+14. PAGE BREAKS: When the user asks to "insert a page break before/after [Section X]", emit ONE layout_op task. Description: "Insert a page break before [Section X] section". Target hint: "before [Section X] section" (e.g., "before Action Items section"). The resolver will provide the heading ID of that section as the anchor.
 
 Return ONLY a JSON object:
 {
