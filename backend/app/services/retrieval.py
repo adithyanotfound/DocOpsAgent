@@ -34,6 +34,9 @@ class RetrievalService:
         if settings.llm_provider == "gemini":
             from app.services.embedding_client import GeminiEmbeddingClient
             return GeminiEmbeddingClient()
+        elif settings.llm_provider == "openrouter":
+            from app.services.embedding_client import OpenRouterEmbeddingClient
+            return OpenRouterEmbeddingClient()
         else:
             # Fallback to OpenAI embedding method
             from app.services.embedding_client import OpenAIEmbeddingClient

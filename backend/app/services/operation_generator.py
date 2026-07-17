@@ -47,7 +47,7 @@ _TEXT_FORMAT_SCHEMA = """Return a JSON array of text_format operations:
       "underline": true/false/null,
       "font_family": "Arial"/"Calibri"/null,
       "font_size_pt": 11.5 or null,
-      "color_hex": "0000FF" (6-char hex) or null,
+      "color_hex": "0000FF" (MUST be 6-char hex like "FF0000" for red, never use words like "red") or null,
       "highlight_hex": "FFFF00" (6-char hex) or null,
       "alignment": "left"/"center"/"right"/"justify" or null,
       "line_spacing": 1.5 or null,

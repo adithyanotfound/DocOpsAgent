@@ -13,7 +13,7 @@ Configuration (via Settings / .env)
 ------------------------------------
   LLM_PROVIDER       = "gemini" | "openai"       (default: "gemini")
   GEMINI_API_KEY     = <your Gemini API key>      (required when provider=gemini)
-  LLM_MODEL          = "gemini-2.5-flash"         (default)
+  LLM_MODEL          = "gemini-3.1-flash-lite"    (default)
   OPENAI_API_KEY     = <key>                      (required when provider=openai)
   OPENAI_BASE_URL    = <optional base url>        (openai only)
 
@@ -36,12 +36,17 @@ from __future__ import annotations
 
 import json
 import logging
+import time
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Any
 
 from app.core.config import settings
 
 log = logging.getLogger(__name__)
+
+# Track the timestamps of the last 15 Gemini requests
+_gemini_request_times = deque(maxlen=15)
 
 
 # ---------------------------------------------------------------------------
@@ -107,6 +112,15 @@ class LLMClient:
                 )
             return genai.Client(api_key=settings.gemini_api_key)
 
+        if self._provider == "openrouter":
+            from openai import OpenAI
+            if not settings.open_router_api:
+                raise RuntimeError("OPEN_ROUTER_API is not set in .env")
+            return OpenAI(
+                api_key=settings.open_router_api,
+                base_url="https://openrouter.ai/api/v1",
+            )
+
         # Fallback: OpenAI-compatible
         from openai import OpenAI
         if not settings.openai_api_key:
@@ -127,6 +141,8 @@ class LLMClient:
         """Execute a completion request against the configured provider."""
         if self._provider == "gemini":
             return self._complete_gemini(request)
+        elif self._provider == "openrouter":
+            return self._complete_openai(request) # OpenRouter is OpenAI compatible
         return self._complete_openai(request)
 
     # ------------------------------------------------------------------
@@ -148,6 +164,16 @@ class LLMClient:
             # our operations involve open-ended arrays that don't map cleanly
             # to a single Pydantic model. Use plain json mode + parse manually.
             config_kwargs["response_mime_type"] = "application/json"
+
+        # Rate limiter: 15 requests per minute
+        if len(_gemini_request_times) == 15:
+            elapsed = time.time() - _gemini_request_times[0]
+            if elapsed < 60.0:
+                sleep_time = 60.0 - elapsed
+                log.info(f"Gemini RPM limit reached. Sleeping for {sleep_time:.2f} seconds.")
+                time.sleep(sleep_time)
+        
+        _gemini_request_times.append(time.time())
 
         try:
             response = self._client.models.generate_content(

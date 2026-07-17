@@ -3070,8 +3070,20 @@ class DocumentProcessor:
                     pPr.remove(outlineLvl)
 
         # Normalise color_hex: strip '#' prefix so both "FF0000" and "#FF0000" work
-        raw_color = params.get("color_hex", "")
-        color_hex = str(raw_color).strip().lstrip("#").upper() if raw_color else ""
+        raw_color = str(params.get("color_hex", "")).strip().lstrip("#").upper()
+        _color_map = {
+            "RED": "FF0000",
+            "BLUE": "0000FF",
+            "GREEN": "00FF00",
+            "BLACK": "000000",
+            "WHITE": "FFFFFF",
+            "YELLOW": "FFFF00",
+            "PURPLE": "800080",
+            "ORANGE": "FFA500",
+            "GREY": "808080",
+            "GRAY": "808080"
+        }
+        color_hex = _color_map.get(raw_color, raw_color)
 
         runs = para.runs
         # If the paragraph has no runs but has text, create one to hold the formatting

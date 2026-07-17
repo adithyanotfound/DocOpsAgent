@@ -41,7 +41,7 @@ export function ChatPanel({ workspace }: Props) {
   const [draft, setDraft] = useState("");
   const [attachedImage, setAttachedImage] = useState<File | null>(null);
   const [imagePreview, setImagePreview] = useState<string | null>(null);
-  const [selectedModel, setSelectedModel] = useState<string>("gpt-4o-mini");
+  const [selectedModel, setSelectedModel] = useState<string>("openrouter-gemini-2.5-flash-lite");
   const bottomRef = useRef<HTMLDivElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   
@@ -147,8 +147,16 @@ export function ChatPanel({ workspace }: Props) {
     setAttachedImage(null);
     setImagePreview(null);
     
-    const provider = selectedModel.startsWith("gemini") ? "gemini" : "openai";
-    chatMutation.mutate({ content, image: img, provider, model: selectedModel });
+    let provider = "openai";
+    let actualModel = selectedModel;
+    if (selectedModel.startsWith("gemini") && !selectedModel.startsWith("openrouter")) {
+      provider = "gemini";
+    } else if (selectedModel === "openrouter-gemini-2.5-flash-lite") {
+      provider = "openrouter";
+      actualModel = "google/gemini-2.5-flash-lite";
+    }
+    
+    chatMutation.mutate({ content, image: img, provider, model: actualModel });
   }
 
   // ---- Render --------------------------------------------------------
@@ -280,7 +288,8 @@ export function ChatPanel({ workspace }: Props) {
             className="text-xs border-2 border-ink bg-paper px-2 py-1 outline-none focus:bg-accent/30 font-medium cursor-pointer"
             disabled={isAgentRunning}
           >
-            <option value="gemini-2.5-flash">Gemini 2.5 Flash</option>
+            <option value="gemini-3.1-flash-lite">Gemini 3.1 Flash Lite</option>
+            <option value="openrouter-gemini-2.5-flash-lite">OpenRouter (Gemini 2.5 Flash Lite)</option>
             <option value="gpt-4o-mini">GPT-4o Mini</option>
           </select>
         </div>

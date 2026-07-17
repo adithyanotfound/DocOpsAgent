@@ -148,3 +148,46 @@ class OpenAIEmbeddingClient:
         except Exception as exc:
             log.error("openai query embed failed: %s", exc)
             raise
+
+class OpenRouterEmbeddingClient:
+    """Embedding client for OpenRouter."""
+
+    def __init__(self) -> None:
+        from openai import OpenAI
+        import httpx
+        if not settings.open_router_api:
+            raise RuntimeError(
+                "OPEN_ROUTER_API is not set. Required for OpenRouterEmbeddingClient."
+            )
+        self._client = OpenAI(
+            api_key=settings.open_router_api,
+            base_url="https://openrouter.ai/api/v1",
+            timeout=httpx.Timeout(60.0, read=60.0, write=60.0, connect=10.0),
+        )
+        self.model = settings.embedding_model or "openai/text-embedding-3-small"
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        if not texts:
+            return []
+        
+        # Batch texts to prevent write operation timeouts
+        batch_size = 16
+        all_embeddings = []
+        
+        try:
+            for i in range(0, len(texts), batch_size):
+                batch = texts[i:i + batch_size]
+                res = self._client.embeddings.create(input=batch, model=self.model)
+                all_embeddings.extend([data.embedding for data in res.data])
+            return all_embeddings
+        except Exception as exc:
+            log.error("openrouter embed failed: %s", exc)
+            raise
+
+    def embed_query(self, text: str) -> list[float]:
+        try:
+            res = self._client.embeddings.create(input=[text], model=self.model)
+            return res.data[0].embedding
+        except Exception as exc:
+            log.error("openrouter query embed failed: %s", exc)
+            raise

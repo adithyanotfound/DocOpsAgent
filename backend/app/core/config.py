@@ -17,17 +17,19 @@ class Settings(BaseSettings):
     # ---------------------------------------------------------------------------
     # LLM provider — "gemini" (default) or "openai" (legacy fallback)
     # ---------------------------------------------------------------------------
-    llm_provider: str = "gemini"
+    llm_provider: str = "openrouter"
 
     # Gemini (primary)
     gemini_api_key: str | None = None
-    llm_model: str = "gemini-2.5-flash"
-    embedding_model: str = "gemini-embedding-2"
+    llm_model: str = "google/gemini-2.5-flash-lite"
+    embedding_model: str = "openai/text-embedding-3-small"
 
     # OpenAI (legacy — kept so the OpenAI provider path still works during
     # any transition period; unused when llm_provider="gemini")
     openai_api_key: str | None = None
     openai_base_url: str | None = None
+
+    open_router_api: str | None = None
 
     # ---------------------------------------------------------------------------
     # Vector store (Qdrant)

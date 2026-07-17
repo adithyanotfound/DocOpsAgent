@@ -159,6 +159,9 @@ class KBRetrievalService:
         if settings.llm_provider == "gemini":
             from app.services.embedding_client import GeminiEmbeddingClient
             return GeminiEmbeddingClient()
+        if settings.llm_provider == "openrouter":
+            from app.services.embedding_client import OpenRouterEmbeddingClient
+            return OpenRouterEmbeddingClient()
         from app.services.embedding_client import OpenAIEmbeddingClient
         return OpenAIEmbeddingClient()
 
