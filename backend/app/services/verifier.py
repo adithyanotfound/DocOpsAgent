@@ -85,25 +85,38 @@ class Verifier:
         validated_tasks = []
         all_satisfied = parsed.get("all_satisfied", True)
         
+        diff_has_changes = bool(
+            diff.get("added_elements") or
+            diff.get("modified_elements") or
+            diff.get("deleted_elements")
+        )
+
         for idx, task in enumerate(tasks):
-            # Find matching result
             match = next((t for t in parsed.get("tasks", []) if t.get("index") == idx), None)
-            if match:
-                validated_tasks.append({
-                    "index": idx,
-                    "description": task["description"],
-                    "satisfied": bool(match.get("satisfied", False)),
-                    "feedback": str(match.get("feedback", "")),
-                })
-                if not match.get("satisfied", False):
+            
+            if task.get("insufficient_kb_evidence"):
+                sat = True
+                fb = f"Insufficient Knowledge Base evidence found for task '{task.get('description')}'. Task exited early with user notification."
+            elif not diff_has_changes:
+                # Deterministic Guard: Zero document changes occurred, task cannot be satisfied
+                sat = False
+                fb = f"No document operations or changes were applied for task '{task.get('description')}'."
+                all_satisfied = False
+            elif match:
+                sat = bool(match.get("satisfied", False))
+                fb = str(match.get("feedback", ""))
+                if not sat:
                     all_satisfied = False
             else:
-                validated_tasks.append({
-                    "index": idx,
-                    "description": task["description"],
-                    "satisfied": True,  # Assume satisfied if omitted
-                    "feedback": "",
-                })
+                sat = True
+                fb = ""
+
+            validated_tasks.append({
+                "index": idx,
+                "description": task.get("description", ""),
+                "satisfied": sat,
+                "feedback": fb,
+            })
 
         return {
             "all_satisfied": all_satisfied,

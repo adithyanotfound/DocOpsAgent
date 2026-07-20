@@ -486,8 +486,14 @@ class DocumentAgentGraph:
         }
 
     async def _resolve_task_references(self, state: AgentState) -> dict:
-        task = state["tasks"][state["current_task_index"]]
-        thought = f"Resolving references for task {state['current_task_index'] + 1}: '{task['description']}'..."
+        idx = state.get("current_task_index", 0)
+        tasks = state.get("tasks", [])
+        if idx >= len(tasks):
+            log.warning("current_task_index (%d) is out of bounds (len=%d) in _resolve_task_references", idx, len(tasks))
+            return {"thoughts": state.get("thoughts", [])}
+
+        task = tasks[idx]
+        thought = f"Resolving references for task {idx + 1}: '{task['description']}'..."
         await self._thought(state, thought)
 
         active_outline = state["current_outline"]
@@ -513,8 +519,49 @@ class DocumentAgentGraph:
         thought2 = f"Resolved targets to element IDs: {resolved_ids}"
         await self._thought(state, thought2)
 
+        # Populate state["kb_context"] if not present
+        kb_ctx = state.get("kb_context")
+        if kb_ctx is None:
+            try:
+                kb_chunks_db = self.repo.list_knowledge_chunks(state["workspace_id"])
+                kb_ctx = [
+                    {
+                        "text": c.text,
+                        "chunk_index": c.chunk_index,
+                        "metadata": {**(c.chunk_metadata or {}), "doc_id": c.document_id},
+                    }
+                    for c in kb_chunks_db
+                ]
+                state["kb_context"] = kb_ctx
+            except Exception as exc:
+                log.warning("Failed to load kb_context in editing loop: %s", exc)
+                state["kb_context"] = []
+                kb_ctx = []
+
+        # Perform targeted per-task KB retrieval for content_generation tasks
+        is_content_gen = task.get("task_type") == "content_generation"
+
+        if is_content_gen and self.kb_retrieval:
+            section_query = f"{task.get('target_hint', '')}: {task.get('description', '')}"
+            chunks, used_semantic = self.kb_retrieval.retrieve_for_section(
+                workspace_id=state["workspace_id"],
+                section_query=section_query,
+                fallback_chunks=kb_ctx,
+                limit=15,
+            )
+            if chunks:
+                task["kb_evidence"] = chunks
+                task["insufficient_kb_evidence"] = False
+                thought_kb = f"Retrieved {len(chunks)} KB chunk(s) for task '{task['description']}'."
+            else:
+                task["kb_evidence"] = []
+                task["insufficient_kb_evidence"] = True
+                thought_kb = f"I couldn't find Knowledge Base content about '{task['description']}' — would you like me to write this section using general knowledge instead, or skip it?"
+            await self._thought(state, thought_kb)
+
         return {
             "resolved_ids": resolved_ids,
+            "kb_context": state.get("kb_context", []),
             "thoughts": state["thoughts"] + [thought, thought2]
         }
 
@@ -526,6 +573,15 @@ class DocumentAgentGraph:
     async def _generate_task_operations(self, state: AgentState) -> dict:
         task_idx = state["current_task_index"]
         task = state["tasks"][task_idx]
+        
+        # Early exit if task has insufficient KB evidence — do not call LLM or generate ops
+        if task.get("insufficient_kb_evidence"):
+            thought = f"Skipping operation generation for task '{task['description']}' due to insufficient KB evidence."
+            await self._thought(state, thought)
+            return {
+                "generated_ops": [],
+                "thoughts": state["thoughts"] + [thought]
+            }
         
         # Fetch repair feedback if this task failed verifier previously
         feedback = state["failed_tasks_feedback"].get(task_idx)
@@ -605,11 +661,16 @@ class DocumentAgentGraph:
             return {"thoughts": state["thoughts"] + [thought]}
 
         # Enrich operations (Visible TOC conversion, placeholder generation)
+        task_idx = max(0, state.get("current_task_index", 1) - 1)
+        tasks = state.get("tasks", [])
+        curr_task = tasks[task_idx] if tasks and task_idx < len(tasks) else None
+
         enriched_ops = self.content_enricher.enrich(
             operations=ops,
             structure=state["structure"],
             document_type=state["document_type"],
             original_request=state["original_request"],
+            task=curr_task,
         )
 
         thought = f"Applying {len(enriched_ops)} document operations..."
@@ -682,6 +743,9 @@ class DocumentAgentGraph:
                         result_feedback[item["index"]] = item["feedback"]
                         if item["index"] < first_failed_idx:
                             first_failed_idx = item["index"]
+
+                if first_failed_idx >= len(state["tasks"]):
+                    first_failed_idx = 0
                 
                 new_accumulated_ops = []
                 for i in range(first_failed_idx):
@@ -1049,13 +1113,27 @@ class DocumentAgentGraph:
                 )
         elif mode == "operations":
             summaries = state.get("op_summaries", [])
+            tasks = state.get("tasks", [])
+            skipped_kb_tasks = [t for t in tasks if t.get("insufficient_kb_evidence")]
+            skipped_msgs = [
+                f"Skipped '{t.get('description', 'content generation')}': no relevant Knowledge Base content found"
+                for t in skipped_kb_tasks
+            ]
+            skipped_desc = "; ".join(skipped_msgs)
+
             if not summaries or not version_num:
-                summary_text = "I wasn't able to apply any changes. Please try rephrasing your request."
+                if skipped_desc:
+                    summary_text = f"No changes applied. {skipped_desc}."
+                else:
+                    summary_text = "I wasn't able to apply any changes. Please try rephrasing your request."
             else:
                 ops_desc = "; ".join(summaries[:5])
                 if len(summaries) > 5:
                     ops_desc += f" … and {len(summaries) - 5} more"
-                summary_text = f"Done! Decomposed into {len(state['tasks'])} task(s) and applied: {ops_desc}."
+                if skipped_desc:
+                    summary_text = f"Done! Decomposed into {len(tasks)} task(s). Applied: {ops_desc}. {skipped_desc}."
+                else:
+                    summary_text = f"Done! Decomposed into {len(tasks)} task(s) and applied: {ops_desc}."
         else:
             slide_plan = state.get("slide_plan", {})
             active_slides = [s for s in slide_plan.get("slides", []) if s.get("action") != "delete"]

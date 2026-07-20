@@ -291,12 +291,39 @@ _AI_DESIGN_OP_SCHEMA = """Return a JSON array of ai_design_op operations:
 ]
 """
 
+_CONTENT_GENERATION_SCHEMA = """Return a JSON array of layout_op operations with action 'insert_block':
+[
+  {
+    "op_type": "layout_op",
+    "target_id": null,
+    "parameters": {
+      "action": "insert_block",
+      "after_id": "ID of element to insert AFTER (or null)",
+      "before_id": "ID of element to insert BEFORE (or null)",
+      "data": [
+        {"role": "heading", "text": "Section Title", "heading_level": 2},
+        {"role": "body", "text": "[Content placeholder]"}
+      ]
+    }
+  }
+]
+
+CRITICAL RULES FOR content_generation:
+1. For the "body" item in data[], set text to EXACTLY "[Content placeholder]".
+2. Do NOT write real paragraph prose at this stage — substantive content will be grounded in Knowledge Base evidence downstream by the enricher.
+3. For the "heading" item in data[], set text to the section title requested by the user.
+4. Set after_id (or before_id) to the anchor ID provided in context.
+5. Output ONLY the raw JSON array — no markdown, no commentary.
+"""
+
+
 _SCHEMA_BY_TYPE = {
     "text_edit": _TEXT_EDIT_SCHEMA,
     "text_format": _TEXT_FORMAT_SCHEMA,
     "table_op": _TABLE_OP_SCHEMA,
     "image_op": _IMAGE_OP_SCHEMA,
     "layout_op": _LAYOUT_OP_SCHEMA,
+    "content_generation": _CONTENT_GENERATION_SCHEMA,
     "list_op": _LIST_OP_SCHEMA,
     "find_replace": _FIND_REPLACE_SCHEMA,
     "theme_op": _THEME_OP_SCHEMA,
@@ -395,9 +422,9 @@ class OperationGenerator:
         resolved_str = json.dumps(ids_list)
         context_str = json.dumps(element_context, indent=2)
         
-        # Include full sections list in outline summary for layout_op so the model 
-        # can pick correct section boundaries for swap_sections
-        if task_type == "layout_op":
+        # Include full sections list in outline summary for layout_op and content_generation so the model 
+        # can pick correct section boundaries for insertion/anchors
+        if task_type in ("layout_op", "content_generation"):
             outline_summary = json.dumps({
                 "document_type": outline.get("document_type"),
                 "title": outline.get("title"),
@@ -487,12 +514,25 @@ class OperationGenerator:
         elif isinstance(parsed, dict):
             ops_raw = parsed.get("operations") or parsed.get("ops") or [parsed]
 
-        # Populate image_path if needed
+        # Normalize op_type and populate image_path if needed
         for op in ops_raw:
-            if isinstance(op, dict) and op.get("op_type") == "image_op" and attached_image_path:
+            if not isinstance(op, dict):
+                continue
+            if op.get("op_type") == "image_op" and attached_image_path:
                 op.setdefault("parameters", {})
                 if not op["parameters"].get("image_path"):
                     op["parameters"]["image_path"] = attached_image_path
+
+            # Normalize op_type for layout operations or content_generation
+            raw_op_type = op.get("op_type")
+            if task_type == "content_generation" or raw_op_type in ("insert_block", "move_block", "insert_toc", "insert_page_break", "duplicate_block"):
+                if raw_op_type != "layout_op":
+                    params = op.setdefault("parameters", {})
+                    if "action" not in params and raw_op_type and raw_op_type != "content_generation":
+                        params["action"] = raw_op_type
+                    elif "action" not in params:
+                        params["action"] = "insert_block"
+                    op["op_type"] = "layout_op"
 
         # Validate
         validated = []

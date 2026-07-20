@@ -286,7 +286,7 @@ class SectionGenerator:
         return "\n\n".join(lines)
 
     def _validate_elements(self, elements: list, content_type: str) -> list[dict]:
-        """Ensure elements have the required structure."""
+        """Ensure elements have the required structure and strip raw citation tags."""
         valid = []
         for el in elements:
             if not isinstance(el, dict):
@@ -294,25 +294,28 @@ class SectionGenerator:
             el_type = el.get("type", "paragraph")
             if el_type == "paragraph":
                 if el.get("text"):
+                    clean_text = re.sub(r'\s*\[chunk:\d+\]', '', str(el["text"]))
                     valid.append({
                         "type": "paragraph",
-                        "text": str(el["text"]),
+                        "text": clean_text,
                         "style": el.get("style", "Normal"),
                     })
             elif el_type == "bullet_list":
                 items = el.get("items", [])
                 if items and isinstance(items, list):
+                    clean_items = [re.sub(r'\s*\[chunk:\d+\]', '', str(i)) for i in items if i]
                     valid.append({
                         "type": "bullet_list",
-                        "items": [str(i) for i in items if i],
+                        "items": clean_items,
                         "style": el.get("style", "List Bullet"),
                     })
             elif el_type == "numbered_list":
                 items = el.get("items", [])
                 if items and isinstance(items, list):
+                    clean_items = [re.sub(r'\s*\[chunk:\d+\]', '', str(i)) for i in items if i]
                     valid.append({
                         "type": "numbered_list",
-                        "items": [str(i) for i in items if i],
+                        "items": clean_items,
                         "style": el.get("style", "List Number"),
                     })
             elif el_type == "table_caption":

@@ -22,7 +22,7 @@ Available task types:
 - text_format: Change formatting (font family/name, font style, bold, color, size, alignment, margins, spacing, bullets, etc.)
 - table_op: Create, modify, or delete tables, columns, rows, or cell contents/styling
 - image_op: Insert, replace, resize, style, reposition, or remove images
-- layout_op: Move sections, swap sections, insert page breaks, add/remove sections, add/remove Table of Contents (TOC)
+- layout_op: Move sections, swap sections, insert page breaks, remove sections, add/remove Table of Contents (TOC). Do NOT use for adding new content sections/paragraphs — use content_generation instead!
 - list_op: Convert list formats (bullets, numbered, checklist), add list items, sort lists
 - find_replace: Global text find and replace across the document
 - theme_op: Slide/page background, margin settings, corporate themes, color palettes
@@ -32,6 +32,7 @@ Available task types:
 - slide_op: Add, delete, duplicate, hide, or reorder slides (for presentations only)
 - generate: Create full slide presentation content from scratch (for presentations only)
 - docx_generate: Generate a comprehensive, full document from scratch using the DOCX template structure and the workspace knowledge base. Use this ONLY for DOCX documents when the user asks to "create", "generate", "write", "draft", "produce", or "build" a full document or major new sections (e.g., "create a financial report", "generate meeting minutes", "write a Q3 summary report"). Do NOT use for targeted edits to existing content.
+- content_generation: Generate new substantive section/paragraph content grounded in workspace Knowledge Base evidence. Use this for requests that add new factual sections, topics, or multi-paragraph content (e.g., "add a sustainability section", "write an ESG summary", "add a section on Q2 financial metrics", "add an environmental impact section"). Do NOT use for simple text rewrites (use text_edit instead) or formatting changes.
 
 For each task, provide:
 - task_type: one of the types above
@@ -42,7 +43,7 @@ For each task, provide:
 
 CRITICAL RULES:
 1. Decompose EVERY distinct action in the request. If the user says "change all headings to green, set margins to 1 inch, and move Table 1 to the end", you MUST output 3 separate tasks.
-2. Group repetitive actions: If adding multiple items to the same list, or applying the same format to a group of elements, combine them into a SINGLE task (e.g., "Add 3 new bullet points to the Highlights list"). Do NOT split them into one task per item.
+2. Group repetitive actions: If adding multiple items to the same list, or applying the same format to a group of elements, combine them into a SINGLE task (e.g., "Add 3 new bullet points to the Highlights list"). Do NOT split them into one task per item. Note: This grouping rule does NOT apply to content_generation tasks for multiple distinct sections.
 3. Ordering matters: tasks must be ordered logically so they can be executed sequentially.
 4. Be precise with target_hint so the resolver can map them accurately. Use ordinal indicators from the outline (like "Table 1", "Section 2") if present. If the request applies to all instances of a type (e.g., "all headings", "all tables", "all images"), use exactly that phrase for target_hint (e.g., "all headings"). Do NOT use "entire document" for these.
 5. DO NOT create image_op tasks (like adding or replacing images/logos) unless the user EXPLICITLY asks you to add, replace, or modify an image. Do not invent image tasks to "improve" the document.
@@ -57,7 +58,8 @@ CRITICAL RULES:
    - Metadata: modify document properties (Title, Author, Subject, Keywords).
    - Headers/Footers: edit contents within headers and footers just like normal body text.
 9. DO NOT invent unsupported tasks (e.g., floating images, rounded corners, drop shadows). For aesthetic requests (e.g., "make it modern"), creatively combine the SUPPORTED properties (like changing heading fonts to sans-serif, using elegant dark gray colors, adjusting page layout, and adding paragraph spacing).
-10. INSERTING CONTENT INTO/AFTER A SECTION: When the user says "insert N paragraphs/sections after [Section X]" or "add content below [Section X]", emit exactly ONE layout_op task — not one task per paragraph. The description must say how many items to insert and what topics. Example: "Insert 3 paragraphs after Executive Summary covering sustainability, AI, and employee development". The target_hint must reference the section, e.g., "after Executive Summary section".
+10. ADDING NEW CONTENT SECTIONS / PARAGRAPHS: When the user asks to add, insert, or write new content sections, paragraphs, or factual topics (e.g., "add an environmental impact section", "add a sustainability section", "insert content below Executive Summary"), you MUST emit task_type: content_generation. NEVER use layout_op for adding new factual text content.
+11. MULTI-SECTION CONTENT GENERATION: When a request asks to add multiple distinct new factual sections or topics (e.g. "add sustainability and ESG sections"), you MUST emit separate content_generation tasks — one per distinct section/topic (e.g. Task 1: "Generate sustainability section", Task 2: "Generate ESG metrics section") — so each section can independently retrieve its own Knowledge Base evidence. Do NOT combine multiple distinct new sections into a single task.
 11. SWAPPING SECTIONS: When the user asks to "swap", "exchange", or "switch" two sections, emit ONE layout_op task. The description should be "Swap [Section A] and [Section B] sections". The target_hint should name both sections, e.g., "Action Items and Key Metrics sections".
 12. SECTION INSERTION HINT FORMAT: For target_hint when inserting content after a section, always use the pattern "after [Section Name] section" (e.g., "after Executive Summary section"). This tells the resolver to use the end of the section — after all existing content — as the insertion anchor.
 13. MOVING SECTIONS (DISTINCT FROM SWAPPING): When the user says "move [Section X] above [Section Y]", "move [Section X] before [Section Y]", "move [Section X] below [Section Y]", or "move [Section X] after [Section Y]", this is a MOVE, not a swap. Emit ONE layout_op task with description "Move [Section X] section above/below [Section Y] section". The target_hint MUST use the pattern "[Section X] above [Section Y]" or "[Section X] below [Section Y]" (e.g., "Action Items above Highlights", "Company Overview below Business Objectives"). NEVER use "swap" for move requests — swap exchanges both sections, move only relocates one.
@@ -66,6 +68,19 @@ CRITICAL RULES:
 16. RENUMBERING VS DUPLICATION: If the user says "make heading X say 3", "renumber section Y to 3", "change the number to 3", or similar — this is a text edit to existing heading text, emit a text_edit task targeting that specific heading element. Do NOT emit a duplicate_block layout task unless the user explicitly asks to create additional copies of a section.
 17. FIXING TOC PAGE NUMBERS: If the user asks to "fix TOC page numbers", "update page numbers in TOC", or complains that TOC page numbers are wrong/missing, DO NOT emit text_edit, layout_op, or duplicate_block tasks! Page numbers in a Table of Contents are calculated automatically by Word/rendering engine on open/print via native TOC fields.
 18. TOC DOT LEADERS & FORMATTING: Requests to adjust TOC dot leaders, extend dotted lines, or format TOC entry alignment must NEVER emit text_format, set_alignment, or generic paragraph operations! Dot leaders and entry alignments are handled natively in Word via TOC tab stops (w:leader='dot' w:val='right').
+
+FEW-SHOT CLASSIFICATION BOUNDARIES:
+- "add an environmental impact section" -> task_type: "content_generation"
+- "insert a sustainability section after Executive Summary" -> task_type: "content_generation"
+- "add an ESG metrics summary" -> task_type: "content_generation"
+- "add a page break before Action Items" -> task_type: "layout_op"
+- "add a table of contents" -> task_type: "layout_op"
+- "move Section 2 above Section 1" -> task_type: "layout_op"
+- "swap Highlights and Financials" -> task_type: "layout_op"
+- "change heading font color to dark green" -> task_type: "text_format"
+- "rewrite conclusion to be shorter" -> task_type: "text_edit"
+- "add 3 new items to the Key Highlights list" -> task_type: "list_op"
+- "add a row to Table 1" -> task_type: "table_op"
 
 Return ONLY a JSON object:
 {

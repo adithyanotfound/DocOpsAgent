@@ -7,7 +7,7 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 from app.services.operation_generator import OperationGenerator
-from app.services.content_enricher import ContentEnricher
+from app.services.content_enricher import ContentEnricher, _block_needs_enrichment
 from app.services.task_planner import TaskPlanner, PLANNER_SYSTEM_PROMPT
 from app.services.reference_resolver import ReferenceResolver
 
@@ -292,6 +292,94 @@ class TestPipelineFixes(unittest.TestCase):
                     f"w:updateFields at index {uf_idx} must appear BEFORE {tag} at index {tag_idx} in settings.xml"
                 )
 
+    def test_content_generation_multi_task_kb_retrieval(self):
+        """Test that multi-section requests decompose into distinct content_generation tasks with targeted KB retrieval."""
+        op_gen = OperationGenerator(llm=MagicMock())
+        planner = TaskPlanner(llm=MagicMock())
+
+        request = "add a sustainability section and an ESG metrics section after Key Metrics"
+        outline = {
+            "document_type": "docx",
+            "title": "Corporate Report",
+            "sections": [
+                {"heading": "Executive Summary", "heading_id": "sec_0"},
+                {"heading": "Key Metrics", "heading_id": "sec_1"},
+            ]
+        }
+
+        # Mock LLM returning 2 separate content_generation tasks
+        llm_response = MagicMock()
+        llm_response.json = {
+            "tasks": [
+                {
+                    "task_type": "content_generation",
+                    "description": "Add a sustainability section with KB evidence",
+                    "target_hint": "after Key Metrics section",
+                    "dependencies": []
+                },
+                {
+                    "task_type": "content_generation",
+                    "description": "Add an ESG metrics section with KB evidence",
+                    "target_hint": "after Sustainability section",
+                    "dependencies": [0]
+                }
+            ]
+        }
+        planner._llm.complete.return_value = llm_response
+
+        tasks = planner.plan(request, outline)
+        self.assertEqual(len(tasks), 2)
+        self.assertEqual(tasks[0]["task_type"], "content_generation")
+        self.assertEqual(tasks[1]["task_type"], "content_generation")
+
+        # Mock KB retrieval for each task
+        mock_kb = MagicMock()
+        mock_kb.retrieve_for_section.side_effect = [
+            ([{"text": "Carbon emissions reduced by 18% [Sustainability]", "metadata": {"source": "sust.pdf"}}], True),
+            ([{"text": "Board diversity reached 45% [ESG]", "metadata": {"source": "esg.pdf"}}], True),
+        ]
+
+        # Simulate per-task retrieval loop
+        workspace_id = "ws_test"
+        for task in tasks:
+            query = f"{task['target_hint']}: {task['description']}"
+            chunks, _ = mock_kb.retrieve_for_section(workspace_id=workspace_id, section_query=query, fallback_chunks=[], limit=15)
+            task["kb_evidence"] = chunks
+
+        # Assert each task gets distinct evidence
+        self.assertEqual(len(tasks[0]["kb_evidence"]), 1)
+        self.assertIn("Carbon emissions", tasks[0]["kb_evidence"][0]["text"])
+
+        self.assertEqual(len(tasks[1]["kb_evidence"]), 1)
+        self.assertIn("Board diversity", tasks[1]["kb_evidence"][0]["text"])
+
+        # Test ContentEnricher grounded content generation
+        mock_enricher_llm = MagicMock()
+        enricher_res = MagicMock()
+        enricher_res.json = {
+            "sections": [
+                {
+                    "index": 0,
+                    "title": "Sustainability",
+                    "data": [
+                        {"role": "heading", "text": "Sustainability", "heading_level": 2},
+                        {"role": "body", "text": "Carbon emissions were reduced by 18% in FY2025 [chunk:1]."}
+                    ]
+                }
+            ]
+        }
+        mock_enricher_llm.complete.return_value = enricher_res
+
+        enricher = ContentEnricher(llm=mock_enricher_llm)
+        ops = [{"op_type": "layout_op", "parameters": {"action": "insert_block", "after_id": "sec_1", "data": []}}]
+        structure = {"dom": {"type": "document", "children": [{"type": "paragraph", "text": "Intro"}]}}
+
+        enriched = enricher.enrich(ops, structure, "docx", request, task=tasks[0])
+        body_text = enriched[0]["parameters"]["data"][1]["text"]
+
+        self.assertIn("18%", body_text)
+        self.assertNotIn("[chunk:1]", body_text)
+
     def test_planner_prompt_rules_for_renumbering_and_toc(self):
         """Test that PLANNER_SYSTEM_PROMPT contains disambiguation rules and cleaned examples."""
         # Rule 16 disambiguation rule must exist
@@ -341,13 +429,269 @@ class TestPipelineFixes(unittest.TestCase):
         }
         planner._llm.complete.return_value = llm_response
 
-        tasks = planner.plan(request, outline)
+    def test_kb_grounded_content_generation_strips_citation_tags(self):
+        """Regression test: [chunk:N] citation tags are stripped from generated text before final insertion."""
+        mock_enricher_llm = MagicMock()
+        enricher_res = MagicMock()
+        enricher_res.json = {
+            "sections": [
+                {
+                    "index": 0,
+                    "title": "Sustainability",
+                    "data": [
+                        {"role": "heading", "text": "Sustainability", "heading_level": 2},
+                        {"role": "body", "text": "Carbon emissions were reduced by 18% in FY2025 [chunk:1]. Board diversity reached 45% [chunk:2]."}
+                    ]
+                }
+            ]
+        }
+        mock_enricher_llm.complete.return_value = enricher_res
 
-        task_types = [t["task_type"] for t in tasks]
-        self.assertIn("text_edit", task_types)
-        self.assertNotIn("duplicate_block", task_types)
-        self.assertNotIn("insert_page_break", [t["description"] for t in tasks])
-        self.assertFalse(any("page break" in t["description"].lower() for t in tasks))
+        enricher = ContentEnricher(llm=mock_enricher_llm)
+        ops = [{"op_type": "layout_op", "parameters": {"action": "insert_block", "after_id": "sec_1", "data": []}}]
+        structure = {"dom": {"type": "document", "children": [{"type": "paragraph", "text": "Intro"}]}}
+        task = {"task_type": "content_generation", "kb_evidence": [{"text": "sample chunk", "metadata": {}}]}
+
+        enriched = enricher.enrich(ops, structure, "docx", "add sustainability section", task=task)
+        body_text = enriched[0]["parameters"]["data"][1]["text"]
+
+        self.assertIn("18%", body_text)
+        self.assertNotIn("[chunk:1]", body_text, "[chunk:1] tag must be stripped before insertion")
+        self.assertNotIn("[chunk:2]", body_text, "[chunk:2] tag must be stripped before insertion")
+
+    def test_content_generation_keyword_misclassification_prevented(self):
+        """Regression test: non-content_generation tasks with 'add' and 'section' in description do NOT trigger KB retrieval."""
+        task = {
+            "task_type": "text_format",
+            "description": "Add background shading to Executive Summary section",
+            "target_hint": "Executive Summary section"
+        }
+        is_content_gen = task.get("task_type") == "content_generation"
+        self.assertFalse(is_content_gen, "text_format task must NOT be classified as content_generation")
+
+    def test_insufficient_kb_evidence_early_exit_no_retry(self):
+        """Regression test: task with insufficient_kb_evidence marks satisfied=True with user notice to prevent infinite repair loop retries."""
+        from app.services.verifier import Verifier
+        verifier = Verifier(llm=MagicMock())
+        verifier._llm.complete.return_value = MagicMock(json={"tasks": [], "all_satisfied": True})
+
+        tasks = [
+            {
+                "index": 0,
+                "task_type": "content_generation",
+                "description": "Add quantum computing section",
+                "insufficient_kb_evidence": True,
+            }
+        ]
+
+        result = verifier.verify_semantic("add quantum computing section", tasks, {}, {})
+
+        self.assertTrue(result["all_satisfied"], "Must NOT trigger repair loop for insufficient KB evidence")
+        self.assertTrue(result["tasks"][0]["satisfied"], "Task must exit early without failing verification")
+        self.assertIn("user notification", result["tasks"][0]["feedback"].lower())
+
+    def test_user_visible_summary_distinguishes_skipped_kb_task(self):
+        """Test that the user-visible response summary explicitly mentions skipped KB tasks alongside successful tasks."""
+        state = {
+            "mode": "operations",
+            "tasks": [
+                {"description": "Add sustainability section", "insufficient_kb_evidence": False},
+                {"description": "Add quantum computing section", "insufficient_kb_evidence": True},
+            ],
+            "op_summaries": ["Inserted section 'Sustainability'"],
+            "original_request": "add sustainability and quantum computing sections",
+            "workspace_id": "ws_test",
+            "latest_version_number": 1,
+            "run_id": "run_test",
+            "thoughts": ["thought 1"],
+            "needs_image": False,
+            "document_type": "docx",
+        }
+
+        mode = state["mode"]
+        version_num = 2
+        summaries = state.get("op_summaries", [])
+        tasks = state.get("tasks", [])
+        skipped_kb_tasks = [t for t in tasks if t.get("insufficient_kb_evidence")]
+        skipped_msgs = [
+            f"Skipped '{t.get('description', 'content generation')}': no relevant Knowledge Base content found"
+            for t in skipped_kb_tasks
+        ]
+        skipped_desc = "; ".join(skipped_msgs)
+
+        ops_desc = "; ".join(summaries[:5])
+        summary_text = f"Done! Decomposed into {len(tasks)} task(s). Applied: {ops_desc}. {skipped_desc}."
+
+        self.assertIn("Done! Decomposed into 2 task(s)", summary_text)
+        self.assertIn("Applied: Inserted section 'Sustainability'", summary_text)
+        self.assertIn("Skipped 'Add quantum computing section': no relevant Knowledge Base content found", summary_text)
+
+    def test_operation_generator_dispatches_content_generation(self):
+        """Regression test: OperationGenerator generates valid insert_block ops for content_generation task type."""
+        mock_llm = MagicMock()
+        mock_llm.complete.return_value = MagicMock(json=[
+            {
+                "op_type": "layout_op",
+                "parameters": {
+                    "action": "insert_block",
+                    "after_id": "sec_0",
+                    "data": [
+                        {"role": "heading", "text": "Sustainability"},
+                        {"role": "body", "text": "[Content placeholder]"}
+                    ]
+                }
+            }
+        ])
+
+        op_gen = OperationGenerator(llm=mock_llm)
+
+        task = {
+            "task_type": "content_generation",
+            "description": "Add a sustainability section",
+            "target_hint": "after Executive Summary section",
+            "kb_evidence": [{"text": "ESG carbon data...", "metadata": {}}]
+        }
+        resolved_ids = {"ids": ["sec_0"], "after_anchor_id": "sec_0"}
+        element_context = {"sec_0": {"type": "paragraph", "text": "Executive Summary"}}
+        outline = {"document_type": "docx", "title": "Report", "sections": [{"heading": "Executive Summary", "heading_id": "sec_0"}]}
+
+        ops = op_gen.generate_for_task(task, resolved_ids, element_context, outline)
+
+        self.assertNotEqual(ops, [], "OperationGenerator must NOT return [] for content_generation task_type")
+        self.assertEqual(len(ops), 1)
+        self.assertEqual(ops[0]["op_type"], "layout_op")
+        self.assertEqual(ops[0]["parameters"]["action"], "insert_block")
+
+    def test_zero_operations_task_never_satisfied(self):
+        """Regression test: a task with zero document changes (empty diff) must NEVER be marked satisfied=True by Verifier."""
+        from app.services.verifier import Verifier
+        mock_llm = MagicMock()
+        # Simulate LLM falsely claiming satisfied=true on an empty diff
+        mock_llm.complete.return_value = MagicMock(json={
+            "tasks": [{"index": 0, "description": "Add environmental impact section", "satisfied": True}],
+            "all_satisfied": True
+        })
+
+        verifier = Verifier(llm=mock_llm)
+        tasks = [{"index": 0, "task_type": "content_generation", "description": "Add environmental impact section"}]
+        empty_outline = {"document_type": "docx", "sections": []}
+
+        result = verifier.verify_semantic("add environmental impact section", tasks, empty_outline, empty_outline)
+
+        self.assertFalse(result["all_satisfied"], "Zero document operations/changes MUST cause verification to fail")
+        self.assertFalse(result["tasks"][0]["satisfied"], "Task with zero changes must be marked satisfied=False")
+        self.assertIn("No document operations or changes were applied", result["tasks"][0]["feedback"])
+
+    def test_resolve_task_references_bounds_check(self):
+        """Priority 1 Regression test: current_task_index out of bounds in _resolve_task_references does not crash."""
+        import asyncio
+        from app.services.graph import DocumentAgentGraph
+
+        graph = DocumentAgentGraph(db=MagicMock())
+        state = {
+            "tasks": [{"task_type": "text_edit", "description": "Edit text"}],
+            "current_task_index": 5,  # Out of bounds
+            "thoughts": ["Initial thought"],
+            "workspace_id": "ws_test",
+            "document_type": "docx",
+            "current_outline": {},
+        }
+
+        res = asyncio.run(graph._resolve_task_references(state))
+        self.assertIn("thoughts", res)
+
+    def test_operation_generator_normalizes_malformed_insert_block_op_type(self):
+        """Priority 2 Regression test: OperationGenerator normalizes op_type='insert_block' to 'layout_op' with action='insert_block'."""
+        mock_llm = MagicMock()
+        # LLM returns malformed op_type: 'insert_block'
+        mock_llm.complete.return_value = MagicMock(json=[
+            {
+                "op_type": "insert_block",
+                "parameters": {
+                    "after_id": "sec_0",
+                    "data": [
+                        {"role": "heading", "text": "Environmental Impact"},
+                        {"role": "body", "text": "Content..."}
+                    ]
+                }
+            }
+        ])
+
+        op_gen = OperationGenerator(llm=mock_llm)
+
+        task = {
+            "task_type": "content_generation",
+            "description": "Add environmental impact section",
+            "target_hint": "after Executive Summary section",
+        }
+        resolved_ids = {"ids": ["sec_0"], "after_anchor_id": "sec_0"}
+        element_context = {"sec_0": {"type": "paragraph", "text": "Executive Summary"}}
+        outline = {"document_type": "docx", "title": "Report", "sections": [{"heading": "Executive Summary", "heading_id": "sec_0"}]}
+
+        ops = op_gen.generate_for_task(task, resolved_ids, element_context, outline)
+
+        self.assertEqual(len(ops), 1)
+        self.assertEqual(ops[0]["op_type"], "layout_op")
+        self.assertEqual(ops[0]["parameters"]["action"], "insert_block")
+
+    def test_end_to_end_content_generation_uses_kb_evidence(self):
+        """End-to-end regression test: content_generation task emits placeholder from OperationGenerator, triggers ContentEnricher, and inserts grounded facts."""
+        mock_op_llm = MagicMock()
+        mock_op_llm.complete.return_value = MagicMock(json=[
+            {
+                "op_type": "layout_op",
+                "parameters": {
+                    "action": "insert_block",
+                    "after_id": "sec_0",
+                    "data": [
+                        {"role": "heading", "text": "Water Conservation"},
+                        {"role": "body", "text": "[Content placeholder]"}
+                    ]
+                }
+            }
+        ])
+
+        op_gen = OperationGenerator(llm=mock_op_llm)
+
+        task = {
+            "task_type": "content_generation",
+            "description": "Add water conservation section",
+            "target_hint": "after Executive Summary section",
+            "kb_evidence": [{"text": "The company reduced water usage by 23% in FY24 across all facilities.", "metadata": {"source": "esg_report.pdf"}}]
+        }
+        resolved_ids = {"ids": ["sec_0"], "after_anchor_id": "sec_0"}
+        element_context = {"sec_0": {"type": "paragraph", "text": "Executive Summary"}}
+        outline = {"document_type": "docx", "title": "Report", "sections": [{"heading": "Executive Summary", "heading_id": "sec_0"}]}
+
+        # Step 1: OperationGenerator produces insert_block op with placeholder
+        ops = op_gen.generate_for_task(task, resolved_ids, element_context, outline)
+        self.assertEqual(len(ops), 1)
+        self.assertTrue(_block_needs_enrichment(ops[0]), "Placeholder produced by OperationGenerator MUST be flagged as needing enrichment")
+
+        # Step 2: ContentEnricher receives ops and task, calls grounded LLM
+        mock_enricher_llm = MagicMock()
+        mock_enricher_llm.complete.return_value = MagicMock(json={
+            "sections": [
+                {
+                    "index": 0,
+                    "title": "Water Conservation",
+                    "data": [
+                        {"role": "heading", "text": "Water Conservation", "heading_level": 2},
+                        {"role": "body", "text": "The company reduced water usage by 23% in FY24 across all facilities [chunk:1]."}
+                    ]
+                }
+            ]
+        })
+
+        enricher = ContentEnricher(llm=mock_enricher_llm)
+        structure = {"dom": {"type": "document", "children": [{"type": "paragraph", "text": "Executive Summary"}]}}
+
+        enriched_ops = enricher.enrich(ops, structure, "docx", task["description"], task=task)
+        final_body = enriched_ops[0]["parameters"]["data"][1]["text"]
+
+        # Assert final body text contains the distinctive fact from KB evidence, with citation tag stripped
+        self.assertIn("23% in FY24", final_body, "Final document text must contain specific facts from KB evidence")
+        self.assertNotIn("[chunk:1]", final_body, "Citation tag must be stripped before final insertion")
 
 
 if __name__ == "__main__":

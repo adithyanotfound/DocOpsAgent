@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from datetime import datetime
 
 log = logging.getLogger(__name__)
@@ -238,6 +239,100 @@ def _enrich_sections_with_llm(
     return result
 
 
+def _format_kb_chunks_for_enricher(chunks: list[dict]) -> str:
+    lines = []
+    for i, c in enumerate(chunks[:15]):
+        meta = c.get("metadata", {})
+        source = meta.get("source") or meta.get("doc_id") or "KB Document"
+        page = meta.get("page", "")
+        loc = f"[{source}"
+        if page:
+            loc += f", p.{page}"
+        loc += "]"
+        lines.append(f"[chunk:{i+1}] {loc}\n{c.get('text', '')[:1200]}")
+    return "\n\n".join(lines)
+
+
+def _enrich_sections_with_kb_grounding(
+    ops_needing_enrichment: list[tuple[int, dict]],
+    doc_summary: str,
+    original_request: str,
+    kb_evidence: list[dict],
+    llm,
+) -> dict[int, list[dict]]:
+    """Generate content for insert_block ops grounded strictly in provided KB evidence."""
+    from app.services.llm_client import LLMRequest
+
+    sections = []
+    for idx, op in ops_needing_enrichment:
+        data = op.get("parameters", {}).get("data", [])
+        headings_in_op = [d["text"] for d in data if d.get("role") == "heading" and d.get("text")]
+        section_title = headings_in_op[0] if headings_in_op else "New Section"
+        sections.append({"index": idx, "title": section_title})
+
+    formatted_kb = _format_kb_chunks_for_enricher(kb_evidence)
+
+    system_prompt = (
+        "You are an expert content writer for professional corporate and audit documents.\n"
+        "Your task: Generate substantive content for new document section(s) based STRICTLY on the provided Knowledge Base evidence.\n\n"
+        "RULES:\n"
+        "1. STRICT GROUNDING: Every factual claim (numbers, percentages, dates, names, statistics, initiatives) MUST come directly from the provided KB context.\n"
+        "2. If data for a specific topic is NOT in the KB evidence, do NOT fabricate or estimate details. Just write about what you DO have evidence for.\n"
+        "3. NEVER write 'information not available', 'N/A', 'data not provided', or any disclaimers. Just omit topics without data.\n"
+        "4. INLINE CITATION: Include citation tags [chunk:N] where N matches the chunk number in the KB CONTEXT when stating factual claims from evidence.\n"
+        "5. PROFESSIONAL TONE: Formal, concise, third-person language.\n"
+        "6. Return ONLY a valid JSON object:\n"
+        "   {\n"
+        '     "sections": [\n'
+        "       {\n"
+        '         "index": <number>,\n'
+        '         "title": "<section title>",\n'
+        '         "data": [\n'
+        '           {"role": "heading", "text": "<title>", "heading_level": 2},\n'
+        '           {"role": "body", "text": "<paragraph 1> [chunk:1]"},\n'
+        '           {"role": "body", "text": "<paragraph 2> [chunk:2]"}\n'
+        "         ]\n"
+        "       }\n"
+        "     ]\n"
+        "   }\n"
+        "7. Do NOT include markdown fences, commentary, or any text outside the JSON object."
+    )
+
+    user_prompt = (
+        f"Document Summary:\n{doc_summary}\n\n"
+        f"User Request: {original_request}\n\n"
+        f"KB CONTEXT (Ground your content ONLY in these excerpts):\n{formatted_kb}\n\n"
+        f"Sections needing content:\n{json.dumps(sections, indent=2)}\n\n"
+        "Generate professional, grounded content JSON."
+    )
+
+    response = llm.complete(LLMRequest(
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
+        temperature=0.2,
+        max_tokens=4096,
+        json_mode=True,
+    ))
+
+    parsed = response.json or {}
+    result: dict[int, list[dict]] = {}
+    for section in parsed.get("sections", []):
+        idx = section.get("index")
+        data = section.get("data", [])
+        if isinstance(idx, int) and isinstance(data, list):
+            clean_data = []
+            for item in data:
+                if isinstance(item, dict) and "text" in item:
+                    item_copy = dict(item)
+                    item_copy["text"] = re.sub(r'\s*\[chunk:\d+\]', '', str(item["text"]))
+                    clean_data.append(item_copy)
+                else:
+                    clean_data.append(item)
+            result[idx] = clean_data
+
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Main enricher class
 # ---------------------------------------------------------------------------
@@ -258,6 +353,7 @@ class ContentEnricher:
         structure: dict,
         document_type: str,
         original_request: str,
+        task: dict | None = None,
     ) -> list[dict]:
         """Enrich operations in-place and return the updated list.
 
@@ -299,12 +395,22 @@ class ContentEnricher:
         llm = self._llm or LLMClient()
 
         try:
-            enriched_data_map = _enrich_sections_with_llm(
-                ops_needing_enrichment=ops_needing,
-                doc_summary=doc_summary,
-                original_request=original_request,
-                llm=llm,
-            )
+            kb_evidence = task.get("kb_evidence") if task else None
+            if kb_evidence:
+                enriched_data_map = _enrich_sections_with_kb_grounding(
+                    ops_needing_enrichment=ops_needing,
+                    doc_summary=doc_summary,
+                    original_request=original_request,
+                    kb_evidence=kb_evidence,
+                    llm=llm,
+                )
+            else:
+                enriched_data_map = _enrich_sections_with_llm(
+                    ops_needing_enrichment=ops_needing,
+                    doc_summary=doc_summary,
+                    original_request=original_request,
+                    llm=llm,
+                )
             for idx, new_data in enriched_data_map.items():
                 if new_data:
                     enriched[idx]["parameters"]["data"] = new_data
