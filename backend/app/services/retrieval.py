@@ -46,14 +46,14 @@ class RetrievalService:
     # Public API
     # ------------------------------------------------------------------
 
-    def retrieve(self, query: str, structure: dict, limit: int = 4) -> list[dict]:
+    def retrieve(self, query: str, structure: dict, limit: int = 4, workspace_id: str | None = None) -> list[dict]:
         if settings.qdrant_url and (settings.gemini_api_key or settings.openai_api_key):
             try:
-                return self._retrieve_semantic(query, structure, limit)
+                return self._retrieve_semantic(query, structure, limit, workspace_id)
             except Exception as exc:
                 log.warning("Semantic retrieval failed: %s. Falling back to local.", exc)
                 pass
-        return self._retrieve_local(query, structure, limit)
+        return self._retrieve_local(query, structure, limit, workspace_id)
 
     def index_workspace(self, workspace_id: str, structure: dict) -> None:
         """Upsert all document blocks for a workspace into Qdrant."""
@@ -296,13 +296,8 @@ class RetrievalService:
         except Exception as exc:
             log.warning("Workspace sync failed: %s", exc)
 
-    def _retrieve_semantic(self, query: str, structure: dict, limit: int) -> list[dict]:
+    def _retrieve_semantic(self, query: str, structure: dict, limit: int, workspace_id: str | None = None) -> list[dict]:
         from qdrant_client.models import Filter, FieldCondition, MatchValue
-
-        # Build a mapping of element_id -> block for re-ranking results
-        blocks_by_id = {block["element_id"]: block for block in structure.get("blocks", [])}
-        if not blocks_by_id:
-            return []
 
         embedder = self._get_embedding_client()
         if hasattr(embedder, "embed_query"):
@@ -311,26 +306,42 @@ class RetrievalService:
             query_vector = embedder.embed([query])[0]
 
         qdrant = self._get_qdrant_client()
+        
+        q_filter = None
+        if workspace_id:
+            q_filter = Filter(
+                must=[
+                    FieldCondition(
+                        key="workspace_id",
+                        match=MatchValue(value=workspace_id),
+                    )
+                ]
+            )
 
         results = qdrant.query_points(
             collection_name=COLLECTION_NAME,
             query=query_vector,
             limit=limit,
             score_threshold=0.45,
+            query_filter=q_filter,
         ).points
 
         found: list[dict] = []
         for hit in results:
-            eid = hit.payload.get("element_id") if hit.payload else None
-            if eid and eid in blocks_by_id:
-                found.append(blocks_by_id[eid])
+            if hit.payload:
+                found.append({
+                    "element_id": hit.payload.get("element_id"),
+                    "text": hit.payload.get("text", ""),
+                    "metadata": hit.payload.get("metadata", {}),
+                    "type": hit.payload.get("type", "text")
+                })
         return found
 
     # ------------------------------------------------------------------
     # Local lexical fallback
     # ------------------------------------------------------------------
 
-    def _retrieve_local(self, query: str, structure: dict, limit: int) -> list[dict]:
+    def _retrieve_local(self, query: str, structure: dict, limit: int, workspace_id: str | None = None) -> list[dict]:
         terms = {term for term in re.findall(r"[a-zA-Z0-9]+", query.lower()) if term not in STOPWORDS}
         scored: list[tuple[int, dict]] = []
         for block in structure.get("blocks", []):

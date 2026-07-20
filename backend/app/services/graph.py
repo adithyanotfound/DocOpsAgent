@@ -77,6 +77,8 @@ class AgentState(TypedDict):
 
     # Redesigned loop state
     outline: dict
+    current_outline: dict
+    initial_structure: dict
     analysis: dict
     tasks: list[dict]
     current_task_index: int
@@ -86,6 +88,7 @@ class AgentState(TypedDict):
 
     resolved_ids: dict
     element_context: dict[str, dict]
+    relevant_blocks: dict
     generated_ops: list[dict]
     verify_result: dict
 
@@ -304,11 +307,13 @@ class DocumentAgentGraph:
             "latest_version_number": latest.version_number if latest else 1,
             "source_document_path": current_doc.document_path if current_doc else latest.document_path,
             "structure": structure_row.structure_json,
+            "initial_structure": structure_row.structure_json,
             "chat_history": chat_history,
             "attached_image_path": attached_image_path,
             
             # Staged loop states
             "outline": {},
+            "current_outline": {},
             "tasks": [],
             "current_task_index": 0,
             "task_results": [],
@@ -382,6 +387,7 @@ class DocumentAgentGraph:
         outline = OutlineBuilder.build(state["structure"], state["document_type"])
         return {
             "outline": outline,
+            "current_outline": outline,
             "thoughts": state["thoughts"] + [thought]
         }
 
@@ -416,7 +422,12 @@ class DocumentAgentGraph:
         try:
             # First try Qdrant
             if self.retrieval and hasattr(self.retrieval, "retrieve"):
-                relevant_docs = self.retrieval.retrieve(state["request"], state["structure"], limit=5)
+                relevant_docs = self.retrieval.retrieve(
+                    state["request"], 
+                    state["structure"], 
+                    limit=5,
+                    workspace_id=state.get("workspace_id")
+                )
         except Exception as e:
             pass
 
@@ -424,12 +435,24 @@ class DocumentAgentGraph:
         relevant_ids = [doc["element_id"] for doc in relevant_docs]
         context_blocks = self.context_fetcher.fetch(relevant_ids, state["structure"])
         
+        # INJECT missing blocks from relevant_docs (Knowledge Base docs)
+        for doc in relevant_docs:
+            eid = doc.get("element_id")
+            if eid and (eid not in context_blocks or "error" in context_blocks[eid]):
+                context_blocks[eid] = {
+                    "id": eid,
+                    "text": doc.get("text", ""),
+                    "type": doc.get("type", "text"),
+                    "metadata": doc.get("metadata", {}),
+                    "source": "knowledge_base"
+                }
+        
         thought2 = "Planning structured decomposition of request into atomic tasks..."
         await self._thought(state, thought2)
 
         tasks = self.planner.plan(
             request=state["request"], 
-            outline=state["outline"], 
+            outline=state["current_outline"], 
             chat_history=state["chat_history"],
             analysis=state["analysis"],
             relevant_blocks=context_blocks
@@ -458,6 +481,7 @@ class DocumentAgentGraph:
             "accumulated_ops": [],
             "task_results": [],
             "failed_tasks_feedback": {},
+            "relevant_blocks": context_blocks,
             "thoughts": state["thoughts"] + [thought, thought2, thought3]
         }
 
@@ -468,7 +492,7 @@ class DocumentAgentGraph:
 
         resolved_ids = self.reference_resolver.resolve(
             task.get("target_hint", ""),
-            state["outline"],
+            state["current_outline"],
             task.get("description", "")
         )
         thought2 = f"Resolved targets to element IDs: {resolved_ids}"
@@ -503,10 +527,11 @@ class DocumentAgentGraph:
             task=task,
             resolved_ids=state["resolved_ids"],
             element_context=state["element_context"],
-            outline=state["outline"],
+            outline=state["current_outline"],
             attached_image_path=state.get("attached_image_path"),
             previous_ops=prev_ops,
             verifier_feedback=feedback,
+            relevant_blocks=state.get("relevant_blocks"),
         )
 
         return {
@@ -597,7 +622,7 @@ class DocumentAgentGraph:
             "source_document_path": str(temp_path),
             "op_summaries": summaries,
             "structure": new_structure,
-            "outline": new_outline,
+            "current_outline": new_outline,
             "thoughts": state["thoughts"] + [thought]
         }
 
@@ -656,6 +681,8 @@ class DocumentAgentGraph:
                     "accumulated_ops": new_accumulated_ops,
                     "failed_tasks_feedback": result_feedback,
                     "source_document_path": str(baseline_path),
+                    "structure": state.get("initial_structure", state["structure"]),
+                    "current_outline": state["outline"],
                 })
             else:
                 # We reached max iterations. Do not reset source_document_path

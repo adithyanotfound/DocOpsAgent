@@ -359,6 +359,7 @@ class OperationGenerator:
         attached_image_path: str | None = None,
         previous_ops: list[dict] | None = None,
         verifier_feedback: str | None = None,
+        relevant_blocks: dict | None = None,
     ) -> list[dict]:
         """Generate operations for a SINGLE task in the planner's sequence."""
         task_type = task["task_type"]
@@ -456,8 +457,10 @@ class OperationGenerator:
             f"Element Context: {context_str}\n"
             f"Outline: {outline_summary}\n"
             f"Attached Image: {attached_image_path or 'None'}\n"
-            f"{repair_str}"
         )
+        if relevant_blocks:
+            user_prompt += f"Relevant Full-Text Blocks (from Knowledge Base):\n{json.dumps(relevant_blocks, indent=2)}\n"
+        user_prompt += f"{repair_str}"
 
         response = llm.complete(LLMRequest(
             system_prompt=system_prompt,
