@@ -1,5 +1,5 @@
 from __future__ import annotations
-from files.app_v2.functions import *
+from files.functions import *
 
 # ===== BEGIN services/graph.py =====
 """LangGraph-based document agent workflow.

@@ -9,8 +9,8 @@ from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session
 
 
-from files.app_v2.functions import *
-from files.app_v2.agent import DocumentAgent
+from files.functions import *
+from files.agent import DocumentAgent
 
 router = APIRouter()
 
