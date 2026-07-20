@@ -67,6 +67,45 @@ CUSTOM_NS = 'http://documenteditor.local/ids'
 CUSTOM_PREFIX = 'deid'
 etree.register_namespace(CUSTOM_PREFIX, CUSTOM_NS)
 
+def _enable_update_fields(doc) -> None:
+    """Ensure <w:updateFields w:val="true"/> exists in doc.settings in ECMA-376 schema-compliant order."""
+    try:
+        from docx.oxml import parse_xml
+        from docx.oxml.ns import nsdecls, qn
+
+        settings_el = doc.settings.element
+        existing = settings_el.find(qn('w:updateFields'))
+        if existing is not None:
+            existing.set(qn('w:val'), 'true')
+            return
+
+        uf = parse_xml(r'<w:updateFields %s w:val="true"/>' % nsdecls('w'))
+
+        # Local element names in CT_Settings schema that MUST appear after w:updateFields
+        after_local_names = (
+            'footnotePr', 'endnotePr', 'compat', 'docVars',
+            'rsids', 'mathPr', 'attachedTemplate', 'linkStyles',
+            'stylePaneFormatFilter', 'stylePaneSortMethod',
+            'clrSchemeMapping', 'doNotIncludeSubdocsInStats',
+            'doNotAutoCompressPictures', 'shapeDefaults',
+            'decimalSymbol', 'listSeparator',
+            'docId', 'defaultImageDpi'
+        )
+
+        target = None
+        for child in settings_el:
+            local_name = child.tag.split('}')[-1] if '}' in child.tag else child.tag
+            if local_name in after_local_names:
+                target = child
+                break
+
+        if target is not None:
+            target.addprevious(uf)
+        else:
+            settings_el.append(uf)
+    except Exception as exc:
+        log.warning("Failed to set updateFields in document settings: %s", exc)
+
 # ---------------------------------------------------------------------------
 # Data classes
 # ---------------------------------------------------------------------------
@@ -1716,16 +1755,111 @@ class DocumentProcessor:
                             for run in cell.paragraphs[0].runs:
                                 run.bold = True
 
+                    # Dynamic bookmark ID allocation & deduplication
+                    from docx.oxml.ns import qn as _qn_bmk
+                    existing_bmk_ids = []
+                    for bmk in doc.element.body.iter(_qn_bmk('w:bookmarkStart')):
+                        try:
+                            val = int(bmk.get(_qn_bmk('w:id'), '0'))
+                            existing_bmk_ids.append(val)
+                        except ValueError:
+                            pass
+                    next_bmk_id = max(existing_bmk_ids, default=0) + 1
+
+                    def get_next_bmk_id():
+                        nonlocal next_bmk_id
+                        curr = next_bmk_id
+                        next_bmk_id += 1
+                        return curr
+
+                    # Helper for bookmark insertion in target heading paragraphs
+                    def _ensure_heading_bookmark(doc_ref, bmk_name: str, heading_id: str | None, ri: int, heading_text: str = ""):
+                        from docx.oxml import parse_xml
+                        from docx.oxml.ns import nsdecls, qn
+                        uid_attr = f'{{{CUSTOM_NS}}}uid'
+
+                        for bmk in doc_ref.element.body.iter(qn('w:bookmarkStart')):
+                            if bmk.get(qn('w:name')) == bmk_name:
+                                return
+
+                        target_p = None
+                        if heading_id:
+                            for p in doc_ref.paragraphs:
+                                if p._p.get(uid_attr) == heading_id:
+                                    target_p = p
+                                    break
+
+                        if target_p is None:
+                            headings = [p for p in doc_ref.paragraphs if p.style and p.style.name and "Heading" in p.style.name]
+                            if 0 <= ri < len(headings):
+                                target_p = headings[ri]
+
+                        if target_p is None and heading_text.strip():
+                            clean_heading = heading_text.strip()
+                            for p in doc_ref.paragraphs:
+                                if clean_heading in p.text.strip():
+                                    target_p = p
+                                    break
+
+                        if target_p is not None:
+                            bmk_id = get_next_bmk_id()
+                            bmk_start = parse_xml(r'<w:bookmarkStart %s w:id="%d" w:name="%s"/>' % (nsdecls('w'), bmk_id, bmk_name))
+                            bmk_end = parse_xml(r'<w:bookmarkEnd %s w:id="%d"/>' % (nsdecls('w'), bmk_id))
+                            target_p._p.insert(0, bmk_start)
+                            target_p._p.append(bmk_end)
+
                     # Header row
                     hdr_row = tbl.rows[0]
                     for ci, hdr in enumerate(headers[:num_cols]):
                         _cell_text(hdr_row.cells[ci], hdr, bold=True)
 
                     # Data rows
+                    has_pageref = False
                     for ri, row_data in enumerate(rows):
                         tbl_row = tbl.rows[ri + 1]
                         for ci, cell_val in enumerate(row_data[:num_cols]):
-                            _cell_text(tbl_row.cells[ci], cell_val)
+                            cell = tbl_row.cells[ci]
+                            if isinstance(cell_val, dict) and "pageref" in cell_val:
+                                has_pageref = True
+                                bmk_name = cell_val["pageref"]
+                                page_str = str(cell_val.get("page", "1"))
+                                heading_id = cell_val.get("heading_id")
+                                heading_text = str(row_data[0]) if row_data else ""
+
+                                _ensure_heading_bookmark(doc, bmk_name, heading_id, ri, heading_text)
+
+                                from docx.oxml import parse_xml
+                                from docx.oxml.ns import nsdecls
+                                from xml.sax.saxutils import escape as xml_escape
+
+                                page_esc = xml_escape(page_str)
+                                bmk_esc = xml_escape(bmk_name)
+
+                                fld_xml = (
+                                    r'<w:p %s>'
+                                    r'  <w:r>'
+                                    r'    <w:fldChar w:fldCharType="begin"/>'
+                                    r'  </w:r>'
+                                    r'  <w:r>'
+                                    r'    <w:instrText xml:space="preserve"> PAGEREF %s \h </w:instrText>'
+                                    r'  </w:r>'
+                                    r'  <w:r>'
+                                    r'    <w:fldChar w:fldCharType="separate"/>'
+                                    r'  </w:r>'
+                                    r'  <w:r>'
+                                    r'    <w:t>%s</w:t>'
+                                    r'  </w:r>'
+                                    r'  <w:r>'
+                                    r'    <w:fldChar w:fldCharType="end"/>'
+                                    r'  </w:r>'
+                                    r'</w:p>' % (nsdecls('w'), bmk_esc, page_esc)
+                                )
+                                cell.paragraphs[0]._p.getparent().replace(cell.paragraphs[0]._p, parse_xml(fld_xml))
+                            else:
+                                _cell_text(cell, cell_val)
+
+                    if has_pageref:
+                        _enable_update_fields(doc)
 
                     # ToC style: remove all borders for a clean look
                     if style_hint == "toc":
@@ -1744,6 +1878,61 @@ class DocumentProcessor:
                         tblPr.append(tblBorders)
 
                     new_elements.append(tbl_xml)
+
+                elif role == "toc_field":
+                    from docx.oxml import parse_xml
+                    from docx.oxml.ns import nsdecls
+                    from xml.sax.saxutils import escape as xml_escape
+
+                    field_text = xml_escape(str(item.get("field_text", r'TOC \o "1-3" \h \z \u')))
+                    entries = item.get("entries", [])
+
+                    # Compute usable page width for right tab stop position (default 9360 twips = 6.5 in)
+                    try:
+                        sec = doc.sections[0]
+                        p_width = sec.page_width.twips if sec.page_width else 12240
+                        l_margin = sec.left_margin.twips if sec.left_margin else 1440
+                        r_margin = sec.right_margin.twips if sec.right_margin else 1440
+                        tab_pos = p_width - l_margin - r_margin
+                    except Exception:
+                        tab_pos = 9360
+
+                    cached_runs_xml = ""
+                    if entries:
+                        for idx, entry in enumerate(entries):
+                            entry_text = xml_escape(str(entry.get("text", "")))
+                            page_str = xml_escape(str(entry.get("page", idx + 1)))
+                            cached_runs_xml += f'<w:r><w:t xml:space="preserve">{entry_text}</w:t><w:tab/><w:t>{page_str}</w:t></w:r>'
+                            if idx < len(entries) - 1:
+                                cached_runs_xml += '<w:r><w:br/></w:r>'
+                    else:
+                        cached_runs_xml = '<w:r><w:t xml:space="preserve">Table of Contents entries will update on open.</w:t></w:r>'
+
+                    fld_xml = (
+                        r'<w:p %s>'
+                        r'  <w:pPr>'
+                        r'    <w:tabs>'
+                        r'      <w:tab w:val="right" w:leader="dot" w:pos="%d"/>'
+                        r'    </w:tabs>'
+                        r'  </w:pPr>'
+                        r'  <w:r>'
+                        r'    <w:fldChar w:fldCharType="begin"/>'
+                        r'  </w:r>'
+                        r'  <w:r>'
+                        r'    <w:instrText xml:space="preserve"> %s </w:instrText>'
+                        r'  </w:r>'
+                        r'  <w:r>'
+                        r'    <w:fldChar w:fldCharType="separate"/>'
+                        r'  </w:r>'
+                        r'  %s'
+                        r'  <w:r>'
+                        r'    <w:fldChar w:fldCharType="end"/>'
+                        r'  </w:r>'
+                        r'</w:p>' % (nsdecls('w'), tab_pos, field_text, cached_runs_xml)
+                    )
+                    p_toc = parse_xml(fld_xml)
+                    new_elements.append(p_toc)
+                    _enable_update_fields(doc)
 
                 else:
                     # Default: plain body paragraph with optional bold
@@ -1821,11 +2010,16 @@ class DocumentProcessor:
                   <w:r><w:t>Table of Contents</w:t></w:r>
                 </w:p>
                 <w:p>
+                  <w:pPr>
+                    <w:tabs>
+                      <w:tab w:val="right" w:leader="dot" w:pos="9360"/>
+                    </w:tabs>
+                  </w:pPr>
                   <w:r><w:fldChar w:fldCharType="begin"/></w:r>
                   <w:r><w:instrText xml:space="preserve"> TOC \\o "1-3" \\h \\z \\u </w:instrText></w:r>
                   <w:r><w:fldChar w:fldCharType="separate"/></w:r>
+                  <w:r><w:fldChar w:fldCharType="end"/></w:r>
                 </w:p>
-                <w:p><w:r><w:fldChar w:fldCharType="end"/></w:r></w:p>
               </w:sdtContent>
             </w:sdt>
             """

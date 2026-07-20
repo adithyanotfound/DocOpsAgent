@@ -41,7 +41,7 @@ For each task, provide:
 - dependencies: list of 0-based task indices this task depends on (usually empty, unless task B must run after task A, e.g. add section then add content to it)
 
 CRITICAL RULES:
-1. Decompose EVERY distinct action in the request. If the user says "add page break before Action Items, change all headings to green, and move Table 1 to the end", you MUST output 3 separate tasks.
+1. Decompose EVERY distinct action in the request. If the user says "change all headings to green, set margins to 1 inch, and move Table 1 to the end", you MUST output 3 separate tasks.
 2. Group repetitive actions: If adding multiple items to the same list, or applying the same format to a group of elements, combine them into a SINGLE task (e.g., "Add 3 new bullet points to the Highlights list"). Do NOT split them into one task per item.
 3. Ordering matters: tasks must be ordered logically so they can be executed sequentially.
 4. Be precise with target_hint so the resolver can map them accurately. Use ordinal indicators from the outline (like "Table 1", "Section 2") if present. If the request applies to all instances of a type (e.g., "all headings", "all tables", "all images"), use exactly that phrase for target_hint (e.g., "all headings"). Do NOT use "entire document" for these.
@@ -62,6 +62,10 @@ CRITICAL RULES:
 12. SECTION INSERTION HINT FORMAT: For target_hint when inserting content after a section, always use the pattern "after [Section Name] section" (e.g., "after Executive Summary section"). This tells the resolver to use the end of the section — after all existing content — as the insertion anchor.
 13. MOVING SECTIONS (DISTINCT FROM SWAPPING): When the user says "move [Section X] above [Section Y]", "move [Section X] before [Section Y]", "move [Section X] below [Section Y]", or "move [Section X] after [Section Y]", this is a MOVE, not a swap. Emit ONE layout_op task with description "Move [Section X] section above/below [Section Y] section". The target_hint MUST use the pattern "[Section X] above [Section Y]" or "[Section X] below [Section Y]" (e.g., "Action Items above Highlights", "Company Overview below Business Objectives"). NEVER use "swap" for move requests — swap exchanges both sections, move only relocates one.
 14. PAGE BREAKS: When the user asks to "insert a page break before/after [Section X]", emit ONE layout_op task. Description: "Insert a page break before [Section X] section". Target hint: "before [Section X] section" (e.g., "before Action Items section"). The resolver will provide the heading ID of that section as the anchor.
+15. TABLE OF CONTENTS (TOC): When the user asks to "add a table of contents", "insert a TOC", or "create a table of contents", emit ONE layout_op task with description "Add Table of Contents" and target_hint "before top of document". NEVER use text_edit, text_format, or docx_generate for TOC creation.
+16. RENUMBERING VS DUPLICATION: If the user says "make heading X say 3", "renumber section Y to 3", "change the number to 3", or similar — this is a text edit to existing heading text, emit a text_edit task targeting that specific heading element. Do NOT emit a duplicate_block layout task unless the user explicitly asks to create additional copies of a section.
+17. FIXING TOC PAGE NUMBERS: If the user asks to "fix TOC page numbers", "update page numbers in TOC", or complains that TOC page numbers are wrong/missing, DO NOT emit text_edit, layout_op, or duplicate_block tasks! Page numbers in a Table of Contents are calculated automatically by Word/rendering engine on open/print via native TOC fields.
+18. TOC DOT LEADERS & FORMATTING: Requests to adjust TOC dot leaders, extend dotted lines, or format TOC entry alignment must NEVER emit text_format, set_alignment, or generic paragraph operations! Dot leaders and entry alignments are handled natively in Word via TOC tab stops (w:leader='dot' w:val='right').
 
 Return ONLY a JSON object:
 {
@@ -89,7 +93,7 @@ class TaskPlanner:
         outline: dict,
         chat_history: list[dict] = None,
         analysis: dict = None,
-        relevant_blocks: dict = None
+        relevant_blocks: dict = None,
     ) -> list[dict]:
         """Generate a task list from a user request and outline."""
         llm = self._llm or LLMClient()

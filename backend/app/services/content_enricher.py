@@ -51,11 +51,14 @@ def _block_needs_enrichment(op: dict) -> bool:
     body_items = [d for d in data if d.get("role") != "heading"]
     if not body_items:
         return True
-    all_thin = all(
-        not d.get("text", "").strip() or _is_placeholder(d.get("text", ""))
-        for d in body_items
-    )
-    return all_thin
+
+    for d in body_items:
+        if d.get("role") in ("table", "toc_field") and (d.get("rows") or d.get("headers") or d.get("field_text")):
+            return False
+        if d.get("text", "").strip() and not _is_placeholder(d.get("text", "")):
+            return False
+
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -63,26 +66,33 @@ def _block_needs_enrichment(op: dict) -> bool:
 # ---------------------------------------------------------------------------
 
 def _extract_document_context(structure: dict) -> dict:
-    """Pull a concise context object from the document structure."""
+    """Pull a concise context object from the document structure with cumulative word-count page estimation."""
     dom_children = structure.get("dom", {}).get("children", [])
 
     headings: list[dict] = []
     body_samples: list[str] = []
+    cumulative_words = 0
 
     for el in dom_children:
-        if el.get("type") != "paragraph":
-            continue
-        role = el.get("role", "body")
         text = el.get("text", "").strip()
-        if not text:
-            continue
-        if role == "heading":
+        word_count = len(text.split()) if text else 0
+        if el.get("type") == "table":
+            for row in el.get("rows", []):
+                for cell in row:
+                    word_count += len(str(cell).split())
+
+        role = el.get("role", "body")
+        if el.get("type") == "paragraph" and role == "heading" and text:
+            est_page = max(1, (cumulative_words // 400) + 1)
             headings.append({
                 "text": text,
                 "level": el.get("heading_level", 1),
+                "estimated_page": est_page,
             })
-        elif role == "body" and len(body_samples) < 6:
+        elif role == "body" and text and len(body_samples) < 6:
             body_samples.append(text[:300])
+
+        cumulative_words += word_count
 
     return {
         "headings": headings,
@@ -102,29 +112,48 @@ def _build_doc_summary(ctx: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Visible ToC generation
+# Native Word ToC generation
 # ---------------------------------------------------------------------------
 
+def _sanitize_bookmark_name(name: str) -> str:
+    import re
+    cleaned = re.sub(r'[^a-zA-Z0-9_]', '_', str(name))
+    if not cleaned or not (cleaned[0].isalpha() or cleaned[0] == '_'):
+        cleaned = '_' + cleaned
+    return cleaned[:40]
+
+
 def _make_visible_toc(insert_toc_op: dict, ctx: dict) -> dict:
-    """Convert an insert_toc op into an insert_block op with a visible 2-column table."""
+    """Convert an insert_toc op into an insert_block op with a 2-column table and PAGEREF fields."""
     before_id = insert_toc_op.get("parameters", {}).get("before_id")
     after_id = insert_toc_op.get("parameters", {}).get("after_id")
 
-    headings = ctx["headings"]
+    headings = ctx.get("headings", [])
     if not headings:
-        headings = [{"text": "No headings found", "level": 1}]
+        headings = [{"text": "No headings found", "level": 1, "estimated_page": 1}]
 
-    rows = [["Section", "Page"]]
+    rows = []
     for i, h in enumerate(headings):
-        indent = "\u00a0\u00a0\u00a0\u00a0" * (h["level"] - 1)  # NBSP indent for sub-headings
-        rows.append([f"{indent}{h['text']}", str(i + 1)])
+        indent = "\u00a0\u00a0\u00a0\u00a0" * (h.get("level", 1) - 1)
+        h_id = h.get("heading_id") or f"heading_{i+1}"
+        bmk_name = f"_Ref_{_sanitize_bookmark_name(h_id)}"
+        page_val = str(h.get("estimated_page", 1))
+        heading_text = f"{indent}{h['text']}"
+        rows.append([
+            heading_text,
+            {
+                "pageref": bmk_name,
+                "page": page_val,
+                "heading_id": h.get("heading_id"),
+            }
+        ])
 
     data = [
         {"role": "heading", "text": "Table of Contents", "heading_level": 1},
         {
             "role": "table",
-            "headers": rows[0],
-            "rows": rows[1:],
+            "headers": ["Section", "Page"],
+            "rows": rows,
             "style": "toc",
         },
     ]

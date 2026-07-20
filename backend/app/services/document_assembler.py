@@ -328,13 +328,10 @@ class DocumentAssembler:
             log.debug("Cell background set failed: %s", exc)
 
     def _add_toc(self, doc, headings: list[dict]) -> None:
-        """Insert a visible Table of Contents built from heading list.
-
-        Creates a simple 2-column table: Section | Page Number (estimated).
-        Page numbers are approximated since this is server-side without
-        Word field update support.
-        """
+        """Insert a native Word Table of Contents field."""
         from docx.shared import Pt
+        from docx.oxml import parse_xml
+        from docx.oxml.ns import nsdecls
 
         # Add TOC heading paragraph
         try:
@@ -345,38 +342,24 @@ class DocumentAssembler:
                 run.font.bold = True
                 run.font.size = Pt(14)
 
-        # Build TOC table
-        h1_count = 0
-        toc_entries: list[dict] = []
-        for h in headings:
-            if h["level"] <= 2:
-                toc_entries.append(h)
+        fld_xml = (
+            r'<w:p %s>'
+            r'  <w:r>'
+            r'    <w:fldChar w:fldCharType="begin"/>'
+            r'  </w:r>'
+            r'  <w:r>'
+            r'    <w:instrText xml:space="preserve"> TOC \o "1-3" \h \z \u </w:instrText>'
+            r'  </w:r>'
+            r'  <w:r>'
+            r'    <w:fldChar w:fldCharType="separate"/>'
+            r'  </w:r>'
+            r'  <w:r>'
+            r'    <w:fldChar w:fldCharType="end"/>'
+            r'  </w:r>'
+            r'</w:p>' % nsdecls('w')
+        )
+        p_toc = parse_xml(fld_xml)
+        doc.element.body.append(p_toc)
 
-        if not toc_entries:
-            return
-
-        table = doc.add_table(rows=len(toc_entries) + 1, cols=2)
-        try:
-            table.style = "Table Grid"
-        except Exception:
-            pass
-
-        # Header row
-        hdr = table.rows[0]
-        hdr.cells[0].text = "Section"
-        hdr.cells[1].text = "Page"
-        for cell in hdr.cells:
-            for para in cell.paragraphs:
-                for run in para.runs:
-                    run.font.bold = True
-
-        # TOC entries
-        estimated_page = 1
-        for row_idx, entry in enumerate(toc_entries):
-            row = table.rows[row_idx + 1]
-            indent = "    " * (entry["level"] - 1)
-            row.cells[0].text = f"{indent}{entry['text']}"
-            row.cells[1].text = str(estimated_page)
-            # Rough page estimation: 1 page per H1 section
-            if entry["level"] == 1:
-                estimated_page += 1
+        from app.services.document_processor import _enable_update_fields
+        _enable_update_fields(doc)

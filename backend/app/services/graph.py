@@ -490,9 +490,24 @@ class DocumentAgentGraph:
         thought = f"Resolving references for task {state['current_task_index'] + 1}: '{task['description']}'..."
         await self._thought(state, thought)
 
+        active_outline = state["current_outline"]
+        if state["current_task_index"] > 0 and state.get("accumulated_ops"):
+            try:
+                temp_path = self.storage.workspace_dir(state["workspace_id"]) / f"working_temp.{state['document_type']}"
+                self.processor.apply_operations(
+                    source=Path(state["source_document_path"]),
+                    target=temp_path,
+                    document_type=state["document_type"],
+                    operations=state["accumulated_ops"],
+                )
+                temp_structure = self.processor.extract(temp_path, state["document_type"])
+                active_outline = OutlineBuilder.build(temp_structure, state["document_type"])
+            except Exception as exc:
+                log.warning("Failed to build intermediate task working outline: %s", exc)
+
         resolved_ids = self.reference_resolver.resolve(
             task.get("target_hint", ""),
-            state["current_outline"],
+            active_outline,
             task.get("description", "")
         )
         thought2 = f"Resolved targets to element IDs: {resolved_ids}"
@@ -720,14 +735,12 @@ class DocumentAgentGraph:
             version_number=new_version,
             structure_json=state["structure"],
         ))
-        self.db.commit()
-        
         # Sync updated document structure to vector index
         self.retrieval.sync_workspace(state["workspace_id"], state["structure"])
         
         pdf_url  = f"/api/files/{state['workspace_id']}/v{new_version}.pdf"
         doc_url  = f"/api/files/{state['workspace_id']}/v{new_version}.{state['document_type']}"
-        
+
         run_store.push_event(state["run_id"], {
             "type": "version_created",
             "version_number": new_version,

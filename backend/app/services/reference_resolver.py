@@ -43,17 +43,11 @@ class ReferenceResolver:
         return {"ids": resolved_ids}
 
     def _section_last_content_id(self, section: dict) -> str | None:
-        """Return the ID of the last non-heading element in a section.
-
-        This is used as `after_anchor_id` so that insertions go at the end of the
-        section's existing content, not immediately after the heading.
-        """
+        """Return the ID of the last non-heading element in a section."""
         elements = section.get("elements", [])
-        # Walk in reverse — skip the heading itself (first element = the heading)
         for el in reversed(elements):
             if el.get("role") != "heading" and el.get("id"):
                 return el["id"]
-        # All content is just the heading, fall back to section_end_id
         return section.get("section_end_id") or section.get("heading_id")
 
     def _find_move_sections(self, hint: str, outline: dict) -> dict | None:

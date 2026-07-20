@@ -186,6 +186,14 @@ Duplicate a range of elements to another location.
   "after_id": "ID of element to insert after"
 }
 
+=== insert_toc ===
+Insert a Table of Contents.
+{
+  "action": "insert_toc",
+  "before_id": "ID of element to insert BEFORE (or null)",
+  "after_id": "ID of element to insert AFTER (or null)"
+}
+
 CRITICAL RULES:
 1. move_block != swap_sections. Use move_block when the user says 'move X above/below Y' (only X relocates).
    Use swap_sections when the user says 'swap X and Y' (both sections change positions).
@@ -195,9 +203,11 @@ CRITICAL RULES:
    on the new page. Use the 'Target Element ID(s)' from context if it contains a heading ID.
 4. For insert_block: GROUP ALL items into ONE operation. If the user asks for 3 paragraphs,
    emit ONE insert_block with ALL 3 items in data[]. NEVER emit multiple insert_block ops.
-5. For set_columns: this applies a document-level column layout — use when user asks for
+5. For insert_toc: When the task asks to add a Table of Contents (TOC), ALWAYS use action 'insert_toc'. NEVER use 'insert_block' or generate paragraph prose for a Table of Contents. The TOC is formatted as a 2-column table (Section | Page) with live Word PAGEREF fields.
+6. For set_columns: this applies a document-level column layout — use when user asks for
    'two-column layout', 'multi-column', or 'side-by-side columns'.
-6. Output ONLY the raw JSON array — no markdown, no commentary.
+7. For TOC dot leaders & formatting: Requests to adjust TOC dot leaders, extend dotted lines to the right, or format TOC entry alignment must NEVER emit 'set_alignment', 'text_format', or generic paragraph formatting operations. TOC tab stops and dot leaders are managed natively in Word via w:tab w:leader='dot' w:val='right'.
+8. Output ONLY the raw JSON array — no markdown, no commentary.
 """
 
 
