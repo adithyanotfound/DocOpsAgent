@@ -881,11 +881,19 @@ class TableOpParams:
 
 class ImageOpParams:
     """Parameters for image operations."""
-    action: str  # "insert"|"replace"|"remove"|"resize"|"reposition"|"rotate"
+    action: str  # "insert"|"replace"|"remove"|"resize"|"reposition"|"move"|"place_inline"|"add_caption"|"reposition_caption"|"format_caption"|"rotate"
                  # "bring_forward"|"send_backward"|"set_transparency"|"set_border"
                  # "rounded_corners"|"shadow"
     image_path: str | None           # server-side absolute path to uploaded image
     position: dict[str, float] | None   # {left_pct, top_pct, width_pct, height_pct}
+    after_id: str | None             # DOCX anchor element for insertions
+    before_id: str | None            # DOCX anchor element for insertions
+    width_page_pct: float | None     # DOCX image width as fraction of usable page width
+    height_page_pct: float | None
+    alignment: str | None            # "left"|"center"|"right"
+    float_position: str | None       # "left"|"right"
+    caption_text: str | None
+    alt_text: str | None
     maintain_aspect_ratio: bool | None
     rotation_degrees: float | None
     transparency_pct: float | None      # 0–100
@@ -1910,7 +1918,7 @@ class DocumentProcessor:
         """Parse a DOM ID (e.g. 'slide_1_shape_2_para_0') into a target dict for the ops engine."""
         if not target_id:
             return {}
-        tgt = {}
+        tgt = {"id": target_id}
         import re
         if m := re.search(r'slide_(\d+)', target_id):
             tgt["slide"] = int(m.group(1))
@@ -3702,11 +3710,15 @@ class DocumentProcessor:
         """Handle image operations for DOCX documents.
 
         Supported actions:
-          insert      — Add a new image paragraph after a body element.
+          insert      — Add a new image paragraph before/after a body element.
           replace     — Replace the drawing in an existing image paragraph.
           resize      — Resize an inline image by width_page_pct or explicit EMU.
-          reposition  — Set paragraph alignment (left/center/right) of an image paragraph.
+          reposition  — Set paragraph alignment (left/center/right) of an image paragraph and its caption.
+          move        — Move an existing image paragraph and its caption before/after another element.
+          place_inline — Move an existing image into a target text paragraph (e.g. right side of title).
           add_caption — Insert a styled caption paragraph after the image paragraph.
+          reposition_caption — Set only the caption paragraph alignment.
+          format_caption — Apply text formatting to the adjacent caption.
           remove      — Remove the image paragraph entirely.
         """
         from docx.oxml.ns import qn
@@ -3714,15 +3726,101 @@ class DocumentProcessor:
         from docx.enum.text import WD_ALIGN_PARAGRAPH
         from docx.shared import Inches, Pt
 
-        action = params.get("action", "insert")
+        action = params.get("action")
+        if not action:
+            action = "reposition" if params.get("alignment") and tgt.get("id") else "insert"
         image_path = params.get("image_path")
         page_w_emu = self._get_docx_page_width_emu(doc)
+
+        if action in ("caption", "add caption"):
+            action = "add_caption"
+        elif action in ("align", "alignment"):
+            action = "reposition"
+
+        position = params.get("position") if isinstance(params.get("position"), dict) else {}
+        if params.get("width_page_pct") is None and position.get("width_pct") is not None:
+            try:
+                params["width_page_pct"] = float(position["width_pct"])
+            except (TypeError, ValueError):
+                None
+        if params.get("height_page_pct") is None and position.get("height_pct") is not None:
+            try:
+                params["height_page_pct"] = float(position["height_pct"])
+            except (TypeError, ValueError):
+                None
+        if not params.get("alignment") and position.get("left_pct") is not None:
+            try:
+                left_pct = float(position["left_pct"])
+                if left_pct >= 0.55:
+                    params["alignment"] = "right"
+                elif left_pct >= 0.25:
+                    params["alignment"] = "center"
+                else:
+                    params["alignment"] = "left"
+            except (TypeError, ValueError):
+                None
+
+        if action == "reposition" and not params.get("alignment"):
+            float_pos = params.get("float_position")
+            if float_pos in ("left", "right"):
+                params["alignment"] = float_pos
+
+        # For DOCX insertions, a paragraph/table target means "insert after this element".
+        if action == "insert" and not params.get("after_id") and not params.get("before_id") and tgt.get("id"):
+            params["after_id"] = tgt["id"]
 
         ALIGN_MAP = {
             "left": WD_ALIGN_PARAGRAPH.LEFT,
             "center": WD_ALIGN_PARAGRAPH.CENTER,
             "right": WD_ALIGN_PARAGRAPH.RIGHT,
         }
+
+        def _is_caption_para(para) -> bool:
+            text = (para.text or "").strip().lower()
+            style_name = ""
+            try:
+                style_name = (para.style.name or "").lower() if para.style else ""
+            except Exception:
+                style_name = ""
+            return (
+                "caption" in style_name
+                or text.startswith("figure ")
+                or text.startswith("fig. ")
+                or text.startswith("image ")
+                or text.startswith("photo ")
+            )
+
+        def _caption_after_image_para(image_para):
+            paras = list(doc.paragraphs)
+            for idx, para in enumerate(paras):
+                if para._p is image_para._p and idx + 1 < len(paras):
+                    candidate = paras[idx + 1]
+                    if _is_caption_para(candidate):
+                        return candidate
+                    break
+            return None
+
+        def _set_para_alignment(para, alignment: str) -> bool:
+            if alignment not in ALIGN_MAP or para is None:
+                return False
+            para.alignment = ALIGN_MAP[alignment]
+            return True
+
+        def _set_image_group_alignment(image_para, alignment: str, include_caption: bool = True) -> bool:
+            changed_local = _set_para_alignment(image_para, alignment)
+            if include_caption:
+                caption_para = _caption_after_image_para(image_para)
+                if caption_para is not None:
+                    changed_local = _set_para_alignment(caption_para, alignment) or changed_local
+            return changed_local
+
+        def _first_body_element_id(exclude_xml: list | None = None) -> str | None:
+            exclude_xml = exclude_xml or []
+            for eid, xml_el in self._build_docx_body_index(doc):
+                if eid.startswith("body_other_") or xml_el in exclude_xml:
+                    continue
+                return eid
+            return None
 
         def _set_alt_text(inline_shape, alt_text: str):
             if not alt_text:
@@ -3760,7 +3858,8 @@ class DocumentProcessor:
                 return ""
 
             after_id = params.get("after_id")  # body_index element id
-            alignment = params.get("alignment", "left")
+            before_id = params.get("before_id")
+            alignment = params.get("alignment", "center")
             width_page_pct = params.get("width_page_pct", 0.5)
             maintain_ar = params.get("maintain_aspect_ratio", True)
             caption_text = params.get("caption_text")
@@ -3783,17 +3882,21 @@ class DocumentProcessor:
             new_p_el = new_para._p
 
             # Move the new paragraph to the correct position
-            if after_id:
+            if before_id or after_id:
                 body_index = self._build_docx_body_index(doc)
                 id_to_elem = {eid: xml_el for eid, xml_el in body_index}
-                after_xml = id_to_elem.get(after_id)
-                if after_xml is not None and after_xml is not new_p_el:
+                anchor_xml = id_to_elem.get(before_id or after_id)
+                if anchor_xml is not None and anchor_xml is not new_p_el:
                     # Remove from its current (appended-at-end) position
                     new_p_el.getparent().remove(new_p_el)
-                    # Insert immediately after the target element
-                    after_xml.addnext(new_p_el)
+                    if before_id:
+                        anchor_xml.addprevious(new_p_el)
+                    else:
+                        anchor_xml.addnext(new_p_el)
 
-            summary = f"Inserted image (width={int(width_page_pct*100)}% page) after '{after_id}'"
+            anchor_id = before_id or after_id
+            anchor_side = "before" if before_id else "after"
+            summary = f"Inserted image (width={int(width_page_pct*100)}% page) {anchor_side} '{anchor_id}'"
 
             # Optional inline caption
             if caption_text:
@@ -3805,6 +3908,7 @@ class DocumentProcessor:
                 cap_p_el = cap_para._p
                 cap_p_el.getparent().remove(cap_p_el)
                 new_p_el.addnext(cap_p_el)
+                cap_para.alignment = ALIGN_MAP.get(alignment, WD_ALIGN_PARAGRAPH.CENTER)
                 summary += f" + caption '{caption_text}'"
 
             return summary
@@ -3849,7 +3953,7 @@ class DocumentProcessor:
             if target_xml is None:
                 return "replace_text: no target paragraph found"
 
-            alignment = params.get("alignment", "left")
+            alignment = params.get("alignment", "center")
             width_page_pct = params.get("width_page_pct", 0.5)
             maintain_ar = params.get("maintain_aspect_ratio", True)
             caption_text = params.get("caption_text")
@@ -3885,6 +3989,7 @@ class DocumentProcessor:
                 cap_p_el = cap_para._p
                 cap_p_el.getparent().remove(cap_p_el)
                 new_p_el.addnext(cap_p_el)
+                cap_para.alignment = ALIGN_MAP.get(alignment, WD_ALIGN_PARAGRAPH.CENTER)
                 summary += f" + caption '{caption_text}'"
 
             return summary
@@ -3960,7 +4065,7 @@ class DocumentProcessor:
             _set_alt_text(shape, params.get("alt_text"))
 
             if alignment and alignment in ALIGN_MAP:
-                img_para.alignment = ALIGN_MAP[alignment]
+                _set_image_group_alignment(img_para, alignment, include_caption=True)
 
             return f"Replaced image {img_idx} with {Path(image_path).name}"
 
@@ -4015,6 +4120,106 @@ class DocumentProcessor:
             return f"Resized image {img_idx} to {int(width_page_pct*100)}% page width"
 
         # ----------------------------------------------------------------
+        # MOVE — relocate image paragraph and adjacent caption together
+        # ----------------------------------------------------------------
+        elif action == "move":
+            if img_para is None:
+                return "move: no image paragraph found"
+
+            before_id = params.get("before_id")
+            after_id = params.get("after_id")
+            placement = str(params.get("placement") or "").lower()
+            alignment = params.get("alignment")
+
+            if not before_id and not after_id and placement in ("top", "top_page", "top_of_page", "top_right", "top_right_page"):
+                caption_para_for_top = _caption_after_image_para(img_para)
+                moving_xml = [img_para._p]
+                if caption_para_for_top is not None:
+                    moving_xml.append(caption_para_for_top._p)
+                before_id = _first_body_element_id(exclude_xml=moving_xml)
+                if not alignment and "right" in placement:
+                    alignment = "right"
+
+            if not before_id and not after_id:
+                alignment = alignment or params.get("float_position")
+                if alignment in ALIGN_MAP:
+                    _set_image_group_alignment(img_para, alignment, include_caption=True)
+                    return f"Moved image {img_idx}: alignment={alignment} with caption"
+                return "move: before_id, after_id, or alignment required"
+
+            body_index = self._build_docx_body_index(doc)
+            id_to_elem = {eid: xml_el for eid, xml_el in body_index}
+            anchor_xml = id_to_elem.get(before_id or after_id)
+            if anchor_xml is None:
+                return f"move: anchor '{before_id or after_id}' not found"
+
+            caption_para = _caption_after_image_para(img_para)
+            moving = [img_para._p]
+            if caption_para is not None:
+                moving.append(caption_para._p)
+
+            if anchor_xml in moving:
+                return "move: target anchor is inside the image/caption group"
+
+            for xml_el in moving:
+                xml_el.getparent().remove(xml_el)
+
+            if before_id:
+                for xml_el in moving:
+                    anchor_xml.addprevious(xml_el)
+            else:
+                current = anchor_xml
+                for xml_el in moving:
+                    current.addnext(xml_el)
+                    current = xml_el
+
+            if alignment in ALIGN_MAP:
+                _set_image_group_alignment(img_para, alignment, include_caption=True)
+
+            side = "before" if before_id else "after"
+            suffix = " with caption" if caption_para is not None else ""
+            return f"Moved image {img_idx}{suffix} {side} '{before_id or after_id}'"
+
+        # ----------------------------------------------------------------
+        # PLACE_INLINE — move image into target paragraph, keeping caption after it
+        # ----------------------------------------------------------------
+        elif action == "place_inline":
+            if img_para is None:
+                return "place_inline: no image paragraph found"
+
+            anchor_id = params.get("anchor_id") or params.get("paragraph_id") or params.get("after_id") or params.get("before_id")
+            if not anchor_id:
+                return "place_inline: anchor_id required"
+
+            _, target_para = _resolve_para_by_id(anchor_id)
+            if target_para is None:
+                return f"place_inline: target paragraph '{anchor_id}' not found"
+
+            caption_para = _caption_after_image_para(img_para)
+            image_runs = [r._r for r in list(img_para.runs)]
+            if not image_runs:
+                return "place_inline: no image run found"
+
+            spacer = target_para.add_run()
+            spacer.add_text("\t")
+            for r_xml in image_runs:
+                r_xml.getparent().remove(r_xml)
+                target_para._p.append(r_xml)
+
+            if img_para._p.getparent() is not None:
+                img_para._p.getparent().remove(img_para._p)
+
+            if caption_para is not None:
+                cap_xml = caption_para._p
+                cap_xml.getparent().remove(cap_xml)
+                target_para._p.addnext(cap_xml)
+                alignment = params.get("alignment", "right")
+                if alignment in ALIGN_MAP:
+                    caption_para.alignment = ALIGN_MAP[alignment]
+
+            return f"Placed image {img_idx} inline with paragraph '{anchor_id}'"
+
+        # ----------------------------------------------------------------
         # REPOSITION — set paragraph alignment of image paragraph
         # ----------------------------------------------------------------
         elif action == "reposition":
@@ -4025,62 +4230,43 @@ class DocumentProcessor:
             if alignment not in ALIGN_MAP:
                 return f"reposition: unknown alignment '{alignment}', use left/center/right"
 
-            img_para.alignment = ALIGN_MAP[alignment]
-
-            # Also move image position: if float_position requested, use anchor wrapping
-            float_pos = params.get("float_position")
-            if float_pos in ("left", "right"):
-                # Convert inline to anchored (floating) with text wrap
-                from docx.oxml.ns import qn as _qn
-                WNS_DRAWING = _qn('w:drawing')
-                WNS_INLINE = _qn('wp:inline')
-                WNS_ANCHOR = _qn('wp:anchor')
-                drawing = img_para._p.find(f'.//{WNS_DRAWING}')
-                if drawing is not None:
-                    inline = drawing.find(WNS_INLINE)
-                    if inline is not None:
-                        # Build a minimal anchor element wrapping the inline content
-                        anchor = OxmlElement('wp:anchor')
-                        h_align = 'right' if float_pos == 'right' else 'left'
-                        anchor.set('distT', '114300')
-                        anchor.set('distB', '114300')
-                        anchor.set('distL', '114300')
-                        anchor.set('distR', '114300')
-                        anchor.set('simplePos', '0')
-                        anchor.set('relativeHeight', '251658240')
-                        anchor.set('behindDoc', '0')
-                        anchor.set('locked', '0')
-                        anchor.set('layoutInCell', '1')
-                        anchor.set('allowOverlap', '1')
-                        # Copy children from inline (extent, graphic, etc.)
-                        for child in list(inline):
-                            anchor.append(child)
-                        # Add positioning children
-                        simple_pos = OxmlElement('wp:simplePos')
-                        simple_pos.set('x', '0'); simple_pos.set('y', '0')
-                        anchor.insert(0, simple_pos)
-                        pos_h = OxmlElement('wp:positionH')
-                        pos_h.set('relativeFrom', 'margin')
-                        align_el = OxmlElement('wp:align')
-                        align_el.text = h_align
-                        pos_h.append(align_el)
-                        pos_v = OxmlElement('wp:positionV')
-                        pos_v.set('relativeFrom', 'paragraph')
-                        align_v = OxmlElement('wp:align')
-                        align_v.text = 'top'
-                        pos_v.append(align_v)
-                        wrapSquare = OxmlElement('wp:wrapSquare')
-                        wrapSquare.set('wrapText', 'bothSides')
-                        anchor.append(simple_pos)
-                        anchor.append(pos_h)
-                        anchor.append(pos_v)
-                        anchor.append(wrapSquare)
-                        drawing.remove(inline)
-                        drawing.append(anchor)
+            _set_image_group_alignment(img_para, alignment, include_caption=True)
 
             return f"Repositioned image {img_idx}: alignment={alignment}" + (
-                f", float={float_pos}" if float_pos else ""
+                " with caption" if _caption_after_image_para(img_para) is not None else ""
             )
+
+        # ----------------------------------------------------------------
+        # REPOSITION_CAPTION — set only the caption paragraph alignment
+        # ----------------------------------------------------------------
+        elif action == "reposition_caption":
+            if img_para is None:
+                return "reposition_caption: no image paragraph found"
+
+            alignment = params.get("alignment", "center")
+            if alignment not in ALIGN_MAP:
+                return f"reposition_caption: unknown alignment '{alignment}', use left/center/right"
+
+            caption_para = _caption_after_image_para(img_para)
+            if caption_para is None:
+                return "reposition_caption: no caption paragraph found"
+
+            caption_para.alignment = ALIGN_MAP[alignment]
+            return f"Repositioned caption for image {img_idx}: alignment={alignment}"
+
+        # ----------------------------------------------------------------
+        # FORMAT_CAPTION — apply text formatting to the adjacent caption
+        # ----------------------------------------------------------------
+        elif action == "format_caption":
+            if img_para is None:
+                return "format_caption: no image paragraph found"
+
+            caption_para = _caption_after_image_para(img_para)
+            if caption_para is None:
+                return "format_caption: no caption paragraph found"
+
+            self._apply_docx_format(caption_para, {}, params)
+            return "Formatted caption for image {}".format(img_idx)
 
         # ----------------------------------------------------------------
         # ADD_CAPTION — insert caption paragraph after image paragraph
@@ -4088,6 +4274,7 @@ class DocumentProcessor:
         elif action == "add_caption":
             caption_text = params.get("caption_text", "")
             caption_style = params.get("caption_style", "Caption")
+            alignment = params.get("alignment", "center")
             if not caption_text:
                 return "add_caption: caption_text required"
             if img_para is None:
@@ -4102,7 +4289,9 @@ class DocumentProcessor:
                 if cap_para.runs:
                     cap_para.runs[0].font.italic = True
                     cap_para.runs[0].font.size = Pt(9)
-            cap_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            cap_para.alignment = ALIGN_MAP.get(alignment, WD_ALIGN_PARAGRAPH.CENTER)
+            if alignment in ALIGN_MAP:
+                img_para.alignment = ALIGN_MAP[alignment]
 
             # Move the caption paragraph to immediately after the image paragraph
             cap_p_el = cap_para._p
@@ -5703,6 +5892,8 @@ class DocumentProcessor:
                     # Extract image dimensions from the drawing element
                     width_emu, height_emu = 0, 0
                     description = ""
+                    image_name = ""
+                    title = ""
                     try:
                         drawing_el = child.find(f'.//{WNS_DRAWING}')
                         extent_el = drawing_el.find('.//{http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing}extent')
@@ -5712,7 +5903,9 @@ class DocumentProcessor:
                         # Try to get alt text / description
                         docPr_el = drawing_el.find('.//{http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing}docPr')
                         if docPr_el is not None:
-                            description = docPr_el.get('descr', '') or docPr_el.get('name', '')
+                            description = docPr_el.get('descr', '') or ""
+                            image_name = docPr_el.get('name', '') or ""
+                            title = docPr_el.get('title', '') or ""
                     except Exception:
                         None
 
@@ -5731,6 +5924,11 @@ class DocumentProcessor:
                         "width_emu": width_emu,
                         "height_emu": height_emu,
                         "description": description,
+                        "name": image_name,
+                        "title": title,
+                        "text": " ".join(
+                            x for x in (description, title, image_name) if x
+                        ).strip(),
                         "alignment": alignment_str,
                     })
 
@@ -7448,6 +7646,10 @@ CRITICAL RULES:
 16. RENUMBERING VS DUPLICATION: If the user says "make heading X say 3", "renumber section Y to 3", "change the number to 3", or similar — this is a text edit to existing heading text, emit a text_edit task targeting that specific heading element. Do NOT emit a duplicate_block layout task unless the user explicitly asks to create additional copies of a section.
 17. FIXING TOC PAGE NUMBERS: If the user asks to "fix TOC page numbers", "update page numbers in TOC", or complains that TOC page numbers are wrong/missing, DO NOT emit text_edit, layout_op, or duplicate_block tasks! Page numbers in a Table of Contents are calculated automatically by Word/rendering engine on open/print via native TOC fields.
 18. TOC DOT LEADERS & FORMATTING: Requests to adjust TOC dot leaders, extend dotted lines, or format TOC entry alignment must NEVER emit text_format, set_alignment, or generic paragraph operations! Dot leaders and entry alignments are handled natively in Word via TOC tab stops (w:leader='dot' w:val='right').
+19. IMAGE INSERTION ANCHORS: For image insertion near text, set target_hint to the anchor element, not to "end of document". Examples: "Insert the company logo below the title" -> task_type image_op, target_hint "the title"; "insert image below Executive Summary" -> target_hint "Executive Summary".
+20. IMAGE IDENTITY: For existing image edits, preserve the user's semantic label in target_hint. Examples: "company logo", "placeholder image", "sales chart", "Image 1". Do NOT use "all images" unless the user explicitly says all/every image.
+21. IMAGE CAPTIONS: "Add a caption below the image..." is image_op targeting the referenced existing image. It does NOT require adding a new image. "Center/left/right align just the caption" and "increase caption font size" are also image_op tasks targeting the image/caption pair, not text_edit.
+22. IMAGE PAGE/TITLE PLACEMENT: "top right corner of the page" means move/insert the image in a new paragraph at the top of the document and right-align it. "right side/corner of the title" means place the image inline in the title paragraph on the right side.
 
 FEW-SHOT CLASSIFICATION BOUNDARIES:
 - "add an environmental impact section" -> task_type: "content_generation"
@@ -7461,6 +7663,15 @@ FEW-SHOT CLASSIFICATION BOUNDARIES:
 - "rewrite conclusion to be shorter" -> task_type: "text_edit"
 - "add 3 new items to the Key Highlights list" -> task_type: "list_op"
 - "add a row to Table 1" -> task_type: "table_op"
+- "insert the company logo below the title" -> task_type: "image_op", target_hint: "the title"
+- "replace the placeholder image with a sales chart" -> task_type: "image_op", target_hint: "placeholder image"
+- "resize the image to 40% of the page width" -> task_type: "image_op", target_hint: "the image"
+- "move the company logo to the right" -> task_type: "image_op", target_hint: "company logo"
+- "add a caption below the image saying Figure 1: Quarterly Sales." -> task_type: "image_op", target_hint: "the image"
+- "move just the caption to the center" -> task_type: "image_op", target_hint: "the image"
+- "increase the caption font size to 12" -> task_type: "image_op", target_hint: "the image"
+- "place the company logo on the top right corner of the page" -> task_type: "image_op", target_hint: "company logo"
+- "place the company logo on the right side of the title" -> task_type: "image_op", target_hint: "company logo"
 
 Return ONLY a JSON object:
 {
@@ -7519,6 +7730,11 @@ class TaskPlanner:
                             "id": el.get("id"),
                             "ordinal_label": el.get("ordinal_label"),
                             "text_preview": el.get("text_preview"),
+                            "alt_text": el.get("alt_text"),
+                            "name": el.get("name"),
+                            "title": el.get("title"),
+                            "size": el.get("size"),
+                            "alignment": el.get("alignment"),
                         } for el in s.get("elements", [])
                     ]
                 } for s in outline.get("sections", [])
@@ -7772,10 +7988,20 @@ class OutlineBuilder:
                 h_emu = el.get("height_emu", 0)
                 w_cm = round(w_emu / 360000, 1) if w_emu else "?"
                 h_cm = round(h_emu / 360000, 1) if h_emu else "?"
+                image_text = " ".join(
+                    str(el.get(k, "")).strip()
+                    for k in ("description", "title", "name", "text")
+                    if str(el.get(k, "")).strip()
+                )
                 el_summary["role"] = "image"
                 el_summary["ordinal_label"] = f"Image {image_counter}"
                 el_summary["size"] = f"{w_cm}cm x {h_cm}cm"
                 el_summary["alt_text"] = el.get("description", "")
+                el_summary["name"] = el.get("name", "")
+                el_summary["title"] = el.get("title", "")
+                el_summary["text_preview"] = image_text[:120]
+                if el.get("alignment"):
+                    el_summary["alignment"] = el.get("alignment")
                 indices["images_by_ordinal"][str(image_counter)] = el_id
             elif el_type == "section":
                 el_summary["role"] = "section"
@@ -8348,6 +8574,28 @@ class ReferenceResolver:
             if img_id:
                 return {"ids": [img_id]}
 
+        image_words = {
+            "image", "picture", "photo", "figure", "logo", "placeholder", "chart",
+            "graph", "company", "sales",
+        }
+        if any(word in hint for word in image_words):
+            image_matches = []
+            for sec in sections:
+                for el in sec.get("elements", []):
+                    if el.get("type") != "image":
+                        continue
+                    haystack = " ".join(
+                        str(el.get(k, "") or "")
+                        for k in ("text_preview", "alt_text", "name", "title", "ordinal_label")
+                    ).lower()
+                    if haystack and (
+                        hint in haystack
+                        or any(tok and tok in haystack for tok in re.findall(r"[a-z0-9]+", hint) if tok not in {"the", "a", "an", "image", "picture", "photo", "figure"})
+                    ):
+                        image_matches.append(el["id"])
+            if len(image_matches) == 1:
+                return {"ids": image_matches}
+
         # Match "all headings" or "headings"
         if hint in ("all headings", "headings", "section headings", "heading"):
             heading_ids = []
@@ -8361,9 +8609,16 @@ class ReferenceResolver:
         if hint in ("all tables", "tables", "both tables"):
             return {"ids": list(indices.get("tables_by_ordinal", {}).values())}
 
-        # Match "all images" or "images" or "logos"
-        if hint in ("all images", "images", "both images", "logos", "logo"):
+        # Match only explicit plural/all-image requests deterministically. Singular
+        # semantic labels like "logo" or "placeholder image" must go through the
+        # semantic resolver so we do not edit the wrong image.
+        if hint in ("all images", "images", "both images"):
             return {"ids": list(indices.get("images_by_ordinal", {}).values())}
+
+        if hint in ("the image", "image", "the picture", "picture", "the photo", "photo", "the figure", "figure"):
+            image_ids = list(indices.get("images_by_ordinal", {}).values())
+            if len(image_ids) == 1:
+                return {"ids": image_ids}
 
         # Match "last paragraph" or "last element"
         if hint in ("last paragraph", "last element", "end of document", "the end", "the end of the document"):
@@ -8478,6 +8733,11 @@ class ReferenceResolver:
                         "id": el["id"],
                         "type": el["type"],
                         "text": el.get("text_preview", ""),
+                        "alt_text": el.get("alt_text", ""),
+                        "name": el.get("name", ""),
+                        "title": el.get("title", ""),
+                        "size": el.get("size", ""),
+                        "alignment": el.get("alignment", ""),
                         "ordinal_label": el.get("ordinal_label", ""),
                     })
 
@@ -9052,8 +9312,25 @@ _IMAGE_OP_SCHEMA = """Return a JSON array of image_op operations:
     "op_type": "image_op",
     "target_id": "image_element_id_or_null" or ["id1", "id2"],
     "parameters": {
-      "action": "insert"|"replace"|"remove"|"resize"|"reposition"|"rotate"|"rounded_corners"|"shadow",
+      "action": "insert"|"replace"|"remove"|"resize"|"reposition"|"move"|"place_inline"|"add_caption"|"reposition_caption"|"format_caption"|"rotate"|"rounded_corners"|"shadow",
       "image_path": "path_to_image_or_placeholder_or_null",
+      "after_id": "element_id_to_insert_after_or_null",
+      "before_id": "element_id_to_insert_before_or_null",
+      "anchor_id": "paragraph_id_for_inline_title_placement_or_null",
+      "placement": "top_right_page|top_page|null",
+      "width_page_pct": 0.4,
+      "height_page_pct": null,
+      "alignment": "left|center|right|null",
+      "float_position": "left|right|null",
+      "caption_text": "caption text or null",
+      "caption_style": "Caption",
+      "font_family": "Arial or null",
+      "font_size_pt": 12,
+      "bold": true/false/null,
+      "italic": true/false/null,
+      "underline": true/false/null,
+      "color_hex": "HEX or null",
+      "alt_text": "short identity/description or null",
       "position": {
         "left_pct": 0.1,
         "top_pct": 0.2,
@@ -9069,6 +9346,22 @@ _IMAGE_OP_SCHEMA = """Return a JSON array of image_op operations:
     }
   }
 ]
+
+DOCX IMAGE RULES:
+1. For "insert below/after X", set target_id to X and set parameters.after_id to X.
+2. For "insert above/before X", set target_id to X and set parameters.before_id to X.
+3. For "below the title", use the title/heading element ID from Target Element ID(s) as after_id.
+4. For "replace the placeholder image", target the placeholder image ID and use action "replace".
+5. For "resize to 40% of page width", use action "resize" and width_page_pct 0.4.
+6. For "center/left/right align the image", use action "reposition" and alignment "center"|"left"|"right". This also aligns the adjacent caption when present.
+7. For "move the image to the right/left side", use action "reposition" and alignment "right"|"left". Do not remove or replace the image for alignment requests.
+8. For captions, use action "add_caption" with caption_text exactly as requested.
+9. For "move/center/left/right align just the caption", use action "reposition_caption" and the requested alignment.
+10. For moving an existing image to another document location, use action "move" with before_id or after_id. The backend moves the adjacent caption with the image.
+11. For formatting an existing caption below an image, use action "format_caption" and include formatting fields such as font_size_pt, font_family, bold, italic, color_hex, or alignment.
+12. For "top right corner of the page", use action "move", placement "top_right_page", and alignment "right" for an existing image. For inserting a new uploaded image there, use action "insert", before_id as the first content ID, and alignment "right".
+13. For "right side/corner of the title", use action "place_inline" with anchor_id set to the title/heading paragraph ID.
+14. Keep target_id as the resolved image ID for replace/resize/reposition/move/place_inline/add_caption/reposition_caption/format_caption/remove. Do not use null for existing-image edits.
 """
 
 _LAYOUT_OP_SCHEMA = """Return a JSON array of layout_op operations.
@@ -9365,7 +9658,17 @@ class OperationGenerator:
         # If it's an image insertion task but no image is attached, return needs_image
         if task_type == "image_op" and not attached_image_path:
             desc_lower = task["description"].lower()
-            if "insert" in desc_lower or "add" in desc_lower or "replace" in desc_lower:
+            caption_intent = "caption" in desc_lower
+            requires_new_image = (
+                "replace" in desc_lower
+                or "insert" in desc_lower
+                or (
+                    "add" in desc_lower
+                    and any(word in desc_lower for word in ("image", "picture", "photo", "logo", "chart", "graph"))
+                    and not caption_intent
+                )
+            )
+            if requires_new_image:
                 return [needs_image_response(f"To satisfy: '{task['description']}', please upload an image.")]
 
         llm = self._llm or LLMClient()
@@ -9479,6 +9782,126 @@ class OperationGenerator:
                 op.setdefault("parameters", {})
                 if not op["parameters"].get("image_path"):
                     op["parameters"]["image_path"] = attached_image_path
+            if op.get("op_type") == "image_op":
+                params = op.setdefault("parameters", {})
+                action = str(params.get("action") or "").lower().strip()
+                desc_lower = task.get("description", "").lower()
+                import re as _re
+                caption_only = (
+                    "caption" in desc_lower
+                    and any(word in desc_lower for word in ("align", "move", "center", "centre", "left", "right"))
+                    and not any(word in desc_lower for word in ("add", "insert", "create"))
+                )
+                caption_format = (
+                    "caption" in desc_lower
+                    and any(word in desc_lower for word in ("font", "size", "bold", "italic", "underline", "color", "colour"))
+                    and not any(word in desc_lower for word in ("add", "insert", "create"))
+                )
+
+                def _title_anchor_id() -> str | None:
+                    for section in outline.get("sections", []):
+                        heading_id = section.get("heading_id")
+                        if heading_id and heading_id != "start":
+                            return heading_id
+                    return outline.get("indices", {}).get("first_content_id")
+
+                if caption_format:
+                    params["action"] = "format_caption"
+                elif caption_only:
+                    params["action"] = "reposition_caption"
+                elif action in ("caption", "add caption"):
+                    params["action"] = "add_caption"
+                elif not action and "caption" in desc_lower:
+                    params["action"] = "add_caption"
+                elif action == "move" and (params.get("before_id") or params.get("after_id")):
+                    params["action"] = "move"
+                elif action in ("move", "align", "alignment"):
+                    params["action"] = "reposition"
+                elif not action and any(word in desc_lower for word in ("align", "center", "centre", "left", "right", "move")):
+                    params["action"] = "reposition"
+
+                title_side_placement = (
+                    "title" in desc_lower
+                    and ("right" in desc_lower or "corner" in desc_lower or "side" in desc_lower)
+                )
+                page_top_placement = (
+                    "top" in desc_lower
+                    and ("right" in desc_lower or "corner" in desc_lower)
+                    and ("page" in desc_lower or "top right" in desc_lower)
+                )
+
+                if title_side_placement:
+                    anchor_id = params.get("anchor_id") or _title_anchor_id()
+                    if anchor_id:
+                        params["anchor_id"] = anchor_id
+                        params["alignment"] = params.get("alignment") or "right"
+                        if attached_image_path and params.get("action") in (None, "", "insert"):
+                            params["action"] = "insert_into_paragraph"
+                            op["target_id"] = anchor_id
+                        else:
+                            params["action"] = "place_inline"
+
+                if page_top_placement and not title_side_placement:
+                    params["alignment"] = params.get("alignment") or "right"
+                    params["placement"] = params.get("placement") or "top_right_page"
+                    if params.get("action") == "insert":
+                        first_content_id = outline.get("indices", {}).get("first_content_id")
+                        if first_content_id and not params.get("before_id") and not params.get("after_id"):
+                            params["before_id"] = first_content_id
+                    elif params.get("action") in (None, "", "reposition"):
+                        params["action"] = "move"
+
+                if params.get("action") == "add_caption" and not params.get("caption_text"):
+                    desc = task.get("description", "")
+                    quote_match = _re.search(r'["“](.+?)["”]', desc)
+                    saying_match = _re.search(r"\bsaying\s+(.+)$", desc, flags=_re.IGNORECASE)
+                    if quote_match:
+                        params["caption_text"] = quote_match.group(1).strip()
+                    elif saying_match:
+                        params["caption_text"] = saying_match.group(1).strip().strip("'\"")
+
+                if params.get("action") == "format_caption":
+                    if params.get("font_size_pt") is None:
+                        size_match = _re.search(r"(?:font\s+size|size)\s*(?:to|=|:)?\s*(\d+(?:\.\d+)?)", desc_lower)
+                        if not size_match:
+                            size_match = _re.search(r"\b(\d+(?:\.\d+)?)\s*(?:pt|points?)\b", desc_lower)
+                        if size_match:
+                            params["font_size_pt"] = float(size_match.group(1))
+                    if params.get("bold") is None and "bold" in desc_lower:
+                        params["bold"] = True
+                    if params.get("italic") is None and "italic" in desc_lower:
+                        params["italic"] = True
+                    if params.get("underline") is None and "underline" in desc_lower:
+                        params["underline"] = True
+
+                position = params.get("position") if isinstance(params.get("position"), dict) else {}
+                if params.get("width_page_pct") is None and position.get("width_pct") is not None:
+                    params["width_page_pct"] = position.get("width_pct")
+
+                if params.get("width_page_pct") is None:
+                    import re as _re
+                    pct_match = _re.search(r"(\d+(?:\.\d+)?)\s*%", desc_lower)
+                    if pct_match:
+                        params["width_page_pct"] = float(pct_match.group(1)) / 100.0
+
+                if not params.get("alignment"):
+                    if "center" in desc_lower or "centre" in desc_lower:
+                        params["alignment"] = "center"
+                    elif "right" in desc_lower:
+                        params["alignment"] = "right"
+                    elif "left" in desc_lower:
+                        params["alignment"] = "left"
+
+                if not params.get("float_position") and "right side" in desc_lower:
+                    params["float_position"] = "right"
+
+                if params.get("action") == "insert" and not params.get("after_id") and not params.get("before_id"):
+                    if after_anchor_id:
+                        params["after_id"] = after_anchor_id
+                    elif ids_list:
+                        params["after_id"] = ids_list[0]
+                    if not op.get("target_id") and params.get("after_id"):
+                        op["target_id"] = params["after_id"]
 
             # Normalize op_type for layout operations or content_generation
             raw_op_type = op.get("op_type")
