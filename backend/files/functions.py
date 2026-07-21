@@ -4196,28 +4196,26 @@ class DocumentProcessor:
                 return f"place_inline: target paragraph '{anchor_id}' not found"
 
             caption_para = _caption_after_image_para(img_para)
-            image_runs = [r._r for r in list(img_para.runs)]
-            if not image_runs:
-                return "place_inline: no image run found"
-
-            spacer = target_para.add_run()
-            spacer.add_text("\t")
-            for r_xml in image_runs:
-                r_xml.getparent().remove(r_xml)
-                target_para._p.append(r_xml)
-
-            if img_para._p.getparent() is not None:
-                img_para._p.getparent().remove(img_para._p)
-
+            moving = [img_para._p]
             if caption_para is not None:
-                cap_xml = caption_para._p
-                cap_xml.getparent().remove(cap_xml)
-                target_para._p.addnext(cap_xml)
-                alignment = params.get("alignment", "right")
-                if alignment in ALIGN_MAP:
-                    caption_para.alignment = ALIGN_MAP[alignment]
+                moving.append(caption_para._p)
 
-            return f"Placed image {img_idx} inline with paragraph '{anchor_id}'"
+            if target_para._p in moving:
+                return "place_inline: target paragraph is inside the image/caption group"
+
+            for xml_el in moving:
+                xml_el.getparent().remove(xml_el)
+
+            current = target_para._p
+            for xml_el in moving:
+                current.addnext(xml_el)
+                current = xml_el
+
+            alignment = params.get("alignment", "right")
+            if alignment in ALIGN_MAP:
+                _set_image_group_alignment(img_para, alignment, include_caption=True)
+
+            return f"Placed image {img_idx} after paragraph '{anchor_id}' aligned {alignment}"
 
         # ----------------------------------------------------------------
         # REPOSITION — set paragraph alignment of image paragraph
@@ -4690,9 +4688,18 @@ class DocumentProcessor:
         action = params.get("action", "create")
         
         if action == "create":
-            rows = params.get("rows", 3)
-            cols = params.get("cols", 3)
+            data = params.get("data") or []
+            if data and not isinstance(data[0], list):
+                data = [[x] for x in data]
+            rows = params.get("rows") or (len(data) if data else 3)
+            cols = params.get("cols") or (max((len(r) for r in data), default=0) if data else 3)
+            rows = max(int(rows), 1)
+            cols = max(int(cols), 1)
             tbl = doc.add_table(rows=rows, cols=cols)
+            if data:
+                for r_idx, row_data in enumerate(data[:rows]):
+                    for c_idx, val in enumerate(row_data[:cols]):
+                        tbl.rows[r_idx].cells[c_idx].text = str(val)
             
             before_id = params.get("before_id")
             after_id = params.get("after_id")
@@ -4720,7 +4727,7 @@ class DocumentProcessor:
                     else:
                         target_xml_el.addnext(tbl_xml)
 
-            return f"Created {rows}x{cols} table"
+            return f"Created {rows}x{cols} table" + (" with data" if data else "")
             
         is_all = tgt.get("type") == "all"
         table_idx = tgt.get("table_index")
@@ -7610,7 +7617,7 @@ Available task types:
 - slide_op: Add, delete, duplicate, hide, or reorder slides (for presentations only)
 - generate: Create full slide presentation content from scratch (for presentations only)
 - docx_generate: Generate a comprehensive, full document from scratch using the DOCX template structure and the workspace knowledge base. Use this ONLY for DOCX documents when the user asks to "create", "generate", "write", "draft", "produce", or "build" a full document or major new sections (e.g., "create a financial report", "generate meeting minutes", "write a Q3 summary report"). Do NOT use for targeted edits to existing content.
-- content_generation: Generate new substantive section/paragraph content grounded in workspace Knowledge Base evidence. Use this for requests that add new factual sections, topics, or multi-paragraph content (e.g., "add a sustainability section", "write an ESG summary", "add a section on Q2 financial metrics", "add an environmental impact section"). Do NOT use for simple text rewrites (use text_edit instead) or formatting changes.
+- content_generation: Generate new substantive section/paragraph content grounded in workspace Knowledge Base evidence. Use this for requests that add new factual sections, topics, or multi-paragraph content (e.g., "add a sustainability section", "write an ESG summary", "add a section on Q2 financial metrics", "add an environmental impact section"). Do NOT use for simple text rewrites, expanding/shortening an existing section, or formatting changes.
 
 For each task, provide:
 - task_type: one of the types above
@@ -7626,6 +7633,7 @@ CRITICAL RULES:
 4. Be precise with target_hint so the resolver can map them accurately. Use ordinal indicators from the outline (like "Table 1", "Section 2") if present. If the request applies to all instances of a type (e.g., "all headings", "all tables", "all images"), use exactly that phrase for target_hint (e.g., "all headings"). Do NOT use "entire document" for these.
 5. DO NOT create image_op tasks (like adding or replacing images/logos) unless the user EXPLICITLY asks you to add, replace, or modify an image. Do not invent image tasks to "improve" the document.
 6. FONT & STYLING INTENT: If the user says "change font to X", "make text Arial", or "use Helvetica", this is ALWAYS a `text_format` task (changing the font family). Do NOT use `text_edit` for these requests!
+6A. SELECTIVE IMPORTANCE HIGHLIGHTING: If the user asks to "highlight important content" or "highlight key/critical content", emit a `text_format` task with target_hint "important content". NEVER use target_hint "all" or "all paragraphs" unless the user explicitly says to highlight everything.
 7. DOCX GENERATION INTENT: If the user asks to "create", "generate", "write", "draft", or "produce" a complete document, report, or major new content (e.g., "create a Q3 financial report", "generate minutes of meeting", "write a compliance report"), and the document type is DOCX, use a single `docx_generate` task. The target_hint should describe the type of document to generate.
 8. KNOW YOUR LIMITATIONS: The document engine natively supports:
    - Text: bold, italic, underline, strikethrough, highlight_color, font name, font size (pt), and font color (RGB hex).
@@ -7637,7 +7645,9 @@ CRITICAL RULES:
    - Headers/Footers: edit contents within headers and footers just like normal body text.
 9. DO NOT invent unsupported tasks (e.g., floating images, rounded corners, drop shadows). For aesthetic requests (e.g., "make it modern"), creatively combine the SUPPORTED properties (like changing heading fonts to sans-serif, using elegant dark gray colors, adjusting page layout, and adding paragraph spacing).
 10. ADDING NEW CONTENT SECTIONS / PARAGRAPHS: When the user asks to add, insert, or write new content sections, paragraphs, or factual topics (e.g., "add an environmental impact section", "add a sustainability section", "insert content below Executive Summary"), you MUST emit task_type: content_generation. NEVER use layout_op for adding new factual text content.
+10A. EXPANDING EXISTING CONTENT: When the user asks to "increase", "expand", "lengthen", "elaborate", "make longer", "shorten", "reduce", or set a word count for an EXISTING section or paragraph, emit task_type: text_edit. NEVER use content_generation or layout_op for this. Preserve the existing heading and rewrite the existing body text in place; do not add a duplicate heading.
 11. MULTI-SECTION CONTENT GENERATION: When a request asks to add multiple distinct new factual sections or topics (e.g. "add sustainability and ESG sections"), you MUST emit separate content_generation tasks — one per distinct section/topic (e.g. Task 1: "Generate sustainability section", Task 2: "Generate ESG metrics section") — so each section can independently retrieve its own Knowledge Base evidence. Do NOT combine multiple distinct new sections into a single task.
+11A. CONCLUSION WITH SUMMARY TABLE: If the user asks to add a conclusion/final summary section with content and a table of ESG/other metrics/findings, emit exactly TWO tasks in order: (1) `content_generation` to add the Conclusion section at the end with ending/summary description text before the table, target_hint "after end of document"; (2) `table_op` to create and populate a detailed findings/metrics table under the Conclusion section, target_hint "after Conclusion section", dependent on task 0. Do NOT create separate ESG Metrics or Other Metrics sections unless explicitly requested.
 11. SWAPPING SECTIONS: When the user asks to "swap", "exchange", or "switch" two sections, emit ONE layout_op task. The description should be "Swap [Section A] and [Section B] sections". The target_hint should name both sections, e.g., "Action Items and Key Metrics sections".
 12. SECTION INSERTION HINT FORMAT: For target_hint when inserting content after a section, always use the pattern "after [Section Name] section" (e.g., "after Executive Summary section"). This tells the resolver to use the end of the section — after all existing content — as the insertion anchor.
 13. MOVING SECTIONS (DISTINCT FROM SWAPPING): When the user says "move [Section X] above [Section Y]", "move [Section X] before [Section Y]", "move [Section X] below [Section Y]", or "move [Section X] after [Section Y]", this is a MOVE, not a swap. Emit ONE layout_op task with description "Move [Section X] section above/below [Section Y] section". The target_hint MUST use the pattern "[Section X] above [Section Y]" or "[Section X] below [Section Y]" (e.g., "Action Items above Highlights", "Company Overview below Business Objectives"). NEVER use "swap" for move requests — swap exchanges both sections, move only relocates one.
@@ -7660,7 +7670,10 @@ FEW-SHOT CLASSIFICATION BOUNDARIES:
 - "move Section 2 above Section 1" -> task_type: "layout_op"
 - "swap Highlights and Financials" -> task_type: "layout_op"
 - "change heading font color to dark green" -> task_type: "text_format"
+- "highlight all the important content in the document" -> task_type: "text_format", target_hint: "important content"
 - "rewrite conclusion to be shorter" -> task_type: "text_edit"
+- "increase the Risk Assessment section to 100 words" -> task_type: "text_edit", target_hint: "Risk Assessment section"
+- "expand the Executive Summary section" -> task_type: "text_edit", target_hint: "Executive Summary section"
 - "add 3 new items to the Key Highlights list" -> task_type: "list_op"
 - "add a row to Table 1" -> task_type: "table_op"
 - "insert the company logo below the title" -> task_type: "image_op", target_hint: "the title"
@@ -7672,6 +7685,7 @@ FEW-SHOT CLASSIFICATION BOUNDARIES:
 - "increase the caption font size to 12" -> task_type: "image_op", target_hint: "the image"
 - "place the company logo on the top right corner of the page" -> task_type: "image_op", target_hint: "company logo"
 - "place the company logo on the right side of the title" -> task_type: "image_op", target_hint: "company logo"
+- "add a final summary table in the end with both ESG and other metrics under a conclusion section with content before the table" -> tasks: content_generation target_hint "after end of document", then table_op target_hint "after Conclusion section"
 
 Return ONLY a JSON object:
 {
@@ -7713,6 +7727,7 @@ class TaskPlanner:
             history_str += "\n"
 
         import json
+        import re
         outline_summary = json.dumps({
             "document_type": outline.get("document_type"),
             "title": outline.get("title"),
@@ -7764,13 +7779,64 @@ class TaskPlanner:
 
         parsed = response.json or {}
         tasks = parsed.get("tasks", [])
+
+        request_l = str(request or "").lower()
+        if (
+            "conclusion" in request_l
+            and "table" in request_l
+            and any(word in request_l for word in ("metric", "metrics", "esg", "finding", "findings", "summary"))
+            and any(word in request_l for word in ("end", "final"))
+        ):
+            return [
+                {
+                    "task_type": "content_generation",
+                    "description": "Add a Conclusion section at the end with concise ending summary content before the table.",
+                    "target_hint": "after end of document",
+                    "dependencies": [],
+                },
+                {
+                    "task_type": "table_op",
+                    "description": "Create a detailed final findings table under the Conclusion section covering ESG metrics and other relevant metrics.",
+                    "target_hint": "after Conclusion section",
+                    "dependencies": [0],
+                },
+            ]
         
         # Simple validation
         validated = []
         for task in tasks:
             if isinstance(task, dict) and task.get("task_type") and task.get("description"):
+                task_type = task["task_type"]
+                description_l = str(task.get("description", "")).lower()
+                target_hint_l = str(task.get("target_hint", "")).lower()
+                existing_rewrite_intent = (
+                    any(word in f"{request_l} {description_l}" for word in (
+                        "increase", "expand", "lengthen", "elaborate", "make longer",
+                        "shorten", "reduce", "condense", "summarize", "summarise",
+                    ))
+                    or bool(re.search(r"\b\d+\s*(?:words?|word)\b", f"{request_l} {description_l}"))
+                )
+                section_or_paragraph_target = (
+                    "section" in target_hint_l
+                    or "paragraph" in target_hint_l
+                    or any(
+                        str(s.get("heading", "")).lower() in target_hint_l
+                        for s in outline.get("sections", [])
+                        if s.get("heading")
+                    )
+                )
+                if task_type == "content_generation" and existing_rewrite_intent and section_or_paragraph_target:
+                    task_type = "text_edit"
+                if (
+                    task_type == "text_format"
+                    and "highlight" in f"{request_l} {description_l}"
+                    and any(word in f"{request_l} {description_l}" for word in ("important", "key", "critical", "main"))
+                    and target_hint_l in ("all", "all paragraphs", "entire document", "document", "all content")
+                ):
+                    target_hint_l = "important content"
+                    task["target_hint"] = "important content"
                 validated.append({
-                    "task_type": task["task_type"],
+                    "task_type": task_type,
                     "description": task["description"],
                     "target_hint": task.get("target_hint") or "all",
                     "dependencies": [d for d in task.get("dependencies", []) if isinstance(d, int)],
@@ -8605,6 +8671,33 @@ class ReferenceResolver:
             if heading_ids:
                 return {"ids": heading_ids}
 
+        if hint in ("important content", "key content", "critical content", "main content", "important points", "key points"):
+            scored: list[tuple[int, str]] = []
+            signal_words = {
+                "key", "important", "critical", "significant", "risk", "risks",
+                "revenue", "growth", "decline", "increase", "decrease", "metric",
+                "metrics", "esg", "finding", "findings", "recommendation",
+                "recommendations", "conclusion", "objective", "objectives",
+                "cybersecurity", "compliance", "supply", "opportunity", "impact",
+            }
+            for sec in sections:
+                for el in sec.get("elements", []):
+                    if el.get("type") != "paragraph" or el.get("role") == "heading":
+                        continue
+                    text = str(el.get("text_preview", "") or "")
+                    words = set(re.findall(r"[a-zA-Z]+", text.lower()))
+                    score = len(words & signal_words)
+                    if re.search(r"[$€£]?\d+(?:\.\d+)?\s*(?:%|percent|million|billion|k|m|bn)?", text, re.I):
+                        score += 3
+                    if el.get("style_summary"):
+                        score += 1
+                    if score > 0 and el.get("id"):
+                        scored.append((score, el["id"]))
+            scored.sort(key=lambda item: item[0], reverse=True)
+            selected = [eid for _, eid in scored[:8]]
+            if selected:
+                return {"ids": selected}
+
         # Match "all tables" or "tables"
         if hint in ("all tables", "tables", "both tables"):
             return {"ids": list(indices.get("tables_by_ordinal", {}).values())}
@@ -8621,10 +8714,13 @@ class ReferenceResolver:
                 return {"ids": image_ids}
 
         # Match "last paragraph" or "last element"
-        if hint in ("last paragraph", "last element", "end of document", "the end", "the end of the document"):
+        if hint in ("last paragraph", "last element", "end of document", "the end", "the end of the document", "after end of document", "after the end of the document"):
             last_id = indices.get("last_element_id")
             if last_id:
-                return {"ids": [last_id]}
+                result = {"ids": [last_id]}
+                if "after" in hint:
+                    result["after_anchor_id"] = last_id
+                return result
 
         # Match "first paragraph" or "first element"
         if hint in ("first paragraph", "first element", "beginning of document", "the beginning", "the beginning of the document", "start of document"):
@@ -8755,7 +8851,8 @@ class ReferenceResolver:
             "2. If the user targets a section (e.g. 'the executive summary'), return ALL element IDs contained within that section (e.g. the heading ID, followed by all paragraphs, tables, images, etc. in that section).\n"
             "3. If the user targets a specific paragraph (e.g. 'the paragraph about revenue growth'), return the ID of that paragraph.\n"
             "4. Return multiple IDs ONLY if the reference clearly targets multiple elements (e.g. 'all paragraphs in section X', or 'the entire section').\n"
-            "5. The provided elements may lack explicit types (e.g., all elements might be marked as 'paragraph'). You MUST infer semantic roles (headings, list items, etc.) based on the actual 'text' content and structural patterns (like short phrases followed by multiple sentences).\n\n"
+            "5. For 'important/key/critical content', return only a focused subset of high-signal body paragraphs containing metrics, risks, findings, recommendations, conclusions, dates, percentages, financial values, or other decision-critical claims. NEVER return all paragraphs for this request.\n"
+            "6. The provided elements may lack explicit types (e.g., all elements might be marked as 'paragraph'). You MUST infer semantic roles (headings, list items, etc.) based on the actual 'text' content and structural patterns (like short phrases followed by multiple sentences).\n\n"
             "Return a JSON object with a single key 'ids' containing an array of matched element IDs:\n"
             "{\n"
             '  "ids": ["id_1", "id_2"]\n'
@@ -9249,6 +9346,15 @@ _TEXT_EDIT_SCHEMA = """Return a JSON array of text_edit operations:
     }
   }
 ]
+
+RULES:
+1. For expanding/shortening an existing section, rewrite existing body paragraph(s) in place.
+2. Do NOT add a new heading or duplicate the section title.
+3. Do NOT target heading elements unless the user asked to change heading text.
+4. If Target Element IDs include a heading and body paragraphs, use only the body paragraph IDs for content expansion.
+5. For a target word count, write natural prose close to that count across the edited paragraph(s).
+6. If Knowledge Base evidence is provided, factual additions MUST be grounded in that evidence. Do not invent or assume numbers, dates, initiatives, risks, opportunities, or outcomes.
+7. If the evidence is thin, expand using cautious synthesis of the existing paragraph and evidence without adding unsupported specifics.
 """
 
 _TEXT_FORMAT_SCHEMA = """Return a JSON array of text_format operations:
@@ -9304,6 +9410,12 @@ _TABLE_OP_SCHEMA = """Return a JSON array of table_op operations:
     }
   }
 ]
+
+RULES:
+1. For creating a summary/findings/metrics table, use action "create" and populate the "data" field with a header row plus evidence-grounded rows.
+2. If Knowledge Base evidence is provided, all metric names, values, dates, ESG facts, and findings must come from that evidence. Do not invent missing metric values.
+3. For "under/after Conclusion section", use the provided Section insertion anchor as after_id.
+4. Do not create separate sections for ESG metrics or other metrics when the user asked for one final table under Conclusion.
 """
 
 _IMAGE_OP_SCHEMA = """Return a JSON array of image_op operations:
@@ -9649,7 +9761,29 @@ class OperationGenerator:
         relevant_blocks: dict | None = None,
     ) -> list[dict]:
         """Generate operations for a SINGLE task in the planner's sequence."""
+        import re
         task_type = task["task_type"]
+        desc_lower_for_route = str(task.get("description", "")).lower()
+        target_lower_for_route = str(task.get("target_hint", "")).lower()
+        existing_rewrite_intent = (
+            any(word in desc_lower_for_route for word in (
+                "increase", "expand", "lengthen", "elaborate", "make longer",
+                "shorten", "reduce", "condense", "summarize", "summarise",
+            ))
+            or bool(re.search(r"\b\d+\s*(?:words?|word)\b", desc_lower_for_route))
+        )
+        existing_section_target = (
+            "section" in target_lower_for_route
+            or "paragraph" in target_lower_for_route
+            or any(
+                str(s.get("heading", "")).lower() in target_lower_for_route
+                for s in outline.get("sections", [])
+                if s.get("heading")
+            )
+        )
+        if task_type == "content_generation" and existing_rewrite_intent and existing_section_target:
+            task_type = "text_edit"
+            task = {**task, "task_type": "text_edit"}
         schema = _SCHEMA_BY_TYPE.get(task_type)
         if not schema:
             log.warning("No operational schema found for task type: %s", task_type)
@@ -9733,6 +9867,24 @@ class OperationGenerator:
             anchor_hint += f"Section A range (for swap): start_id={section_a_range.get('start_id')}, end_id={section_a_range.get('end_id')}\n"
             anchor_hint += f"Section B range (for swap): start_id={section_b_range.get('start_id')}, end_id={section_b_range.get('end_id')}\n"
 
+        if task_type == "text_edit" and existing_rewrite_intent and existing_section_target:
+            body_ids = [
+                eid for eid in ids_list
+                if element_context.get(eid, {}).get("role") != "heading"
+                and element_context.get(eid, {}).get("type") == "paragraph"
+            ]
+            heading_ids = [
+                eid for eid in ids_list
+                if element_context.get(eid, {}).get("role") == "heading"
+            ]
+            if body_ids:
+                anchor_hint += (
+                    f"Existing-section rewrite body IDs (use these, not heading IDs): {json.dumps(body_ids)}\n"
+                )
+            if heading_ids:
+                anchor_hint += (
+                    f"Existing-section heading IDs to preserve unchanged: {json.dumps(heading_ids)}\n"
+                )
 
         system_prompt = (
             f"You are a document operations generator specializing in '{task_type}' changes.\n"
@@ -9755,7 +9907,14 @@ class OperationGenerator:
             f"Outline: {outline_summary}\n"
             f"Attached Image: {attached_image_path or 'None'}\n"
         )
-        if relevant_blocks:
+        task_kb_evidence = task.get("kb_evidence") if isinstance(task, dict) else None
+        if task_kb_evidence:
+            user_prompt += (
+                "Relevant Knowledge Base Evidence (ground factual claims ONLY in these excerpts; "
+                "do not invent numbers, dates, initiatives, risks, metrics, or conclusions not supported here):\n"
+                f"{json.dumps(task_kb_evidence, indent=2)}\n"
+            )
+        elif relevant_blocks:
             user_prompt += f"Relevant Full-Text Blocks (from Knowledge Base):\n{json.dumps(relevant_blocks, indent=2)}\n"
         user_prompt += f"{repair_str}"
 
@@ -9778,6 +9937,18 @@ class OperationGenerator:
         for op in ops_raw:
             if not isinstance(op, dict):
                 continue
+            if (
+                op.get("op_type") == "text_format"
+                and "highlight" in desc_lower_for_route
+                and any(word in desc_lower_for_route for word in ("important", "key", "critical", "main"))
+                and op.get("target_id") in ("all", None)
+            ):
+                op["_skip_broad_important_highlight"] = True
+            if op.get("op_type") == "table_op":
+                params = op.setdefault("parameters", {})
+                action = str(params.get("action") or "").lower().strip()
+                if action == "create" and after_anchor_id and not params.get("after_id") and not params.get("before_id"):
+                    params["after_id"] = after_anchor_id
             if op.get("op_type") == "image_op" and attached_image_path:
                 op.setdefault("parameters", {})
                 if not op["parameters"].get("image_path"):
@@ -9914,10 +10085,22 @@ class OperationGenerator:
                         params["action"] = "insert_block"
                     op["op_type"] = "layout_op"
 
+            if (
+                existing_rewrite_intent
+                and existing_section_target
+                and op.get("op_type") == "layout_op"
+                and op.get("parameters", {}).get("action") == "insert_block"
+            ):
+                op["_skip_existing_section_insert"] = True
+
         # Validate
         validated = []
         for op in ops_raw:
             try:
+                if isinstance(op, dict) and op.get("_skip_broad_important_highlight"):
+                    continue
+                if isinstance(op, dict) and op.get("_skip_existing_section_insert"):
+                    continue
                 validated.append(validate_operation(op))
             except ValueError as e:
                 log.warning("Task op validation failed: %s — %s", op, e)

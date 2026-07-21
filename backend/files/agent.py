@@ -464,12 +464,13 @@ class DocumentAgentGraph:
 
     async def _resolve_task_references(self, state: AgentState) -> dict:
         idx = state.get("current_task_index", 0)
-        tasks = state.get("tasks", [])
+        tasks = list(state.get("tasks", []))
         if idx >= len(tasks):
             log.warning("current_task_index (%d) is out of bounds (len=%d) in _resolve_task_references", idx, len(tasks))
             return {"thoughts": state.get("thoughts", [])}
 
-        task = tasks[idx]
+        task = dict(tasks[idx])
+        tasks[idx] = task
         thought = f"Resolving references for task {idx + 1}: '{task['description']}'..."
         await self._thought(state, thought)
 
@@ -515,10 +516,28 @@ class DocumentAgentGraph:
                 state["kb_context"] = []
                 kb_ctx = []
 
-        # Perform targeted per-task KB retrieval for content_generation tasks
-        is_content_gen = task.get("task_type") == "content_generation"
+        # Perform targeted per-task KB retrieval for generation and factual rewrite/table tasks.
+        # Expanding existing sections is routed as text_edit, but still needs KB grounding
+        # so the rewrite does not invent claims.
+        task_type = task.get("task_type")
+        task_text = f"{task.get('target_hint', '')}: {task.get('description', '')}".lower()
+        factual_text_edit = (
+            task_type == "text_edit"
+            and any(word in task_text for word in (
+                "increase", "expand", "lengthen", "elaborate", "word", "summary",
+                "findings", "metrics", "risk", "esg", "financial", "revenue",
+            ))
+        )
+        factual_table = (
+            task_type == "table_op"
+            and any(word in task_text for word in (
+                "metric", "metrics", "esg", "findings", "summary", "financial",
+                "revenue", "risk", "table",
+            ))
+        )
+        is_grounded_generation = task_type == "content_generation" or factual_text_edit or factual_table
 
-        if is_content_gen and self.kb_retrieval:
+        if is_grounded_generation and self.kb_retrieval:
             section_query = f"{task.get('target_hint', '')}: {task.get('description', '')}"
             chunks, used_semantic = self.kb_retrieval.retrieve_for_section(
                 workspace_id=state["workspace_id"],
@@ -538,6 +557,7 @@ class DocumentAgentGraph:
 
         return {
             "resolved_ids": resolved_ids,
+            "tasks": tasks,
             "kb_context": state.get("kb_context", []),
             "thoughts": state["thoughts"] + [thought, thought2]
         }
