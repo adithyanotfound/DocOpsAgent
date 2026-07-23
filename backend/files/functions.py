@@ -9214,7 +9214,7 @@ def _enrich_sections_with_kb_grounding(
             for item in data:
                 if isinstance(item, dict) and "text" in item:
                     item_copy = dict(item)
-                    item_copy["text"] = re.sub(r'\s*\[chunk:\d+\]', '', str(item["text"]))
+                    item_copy["text"] = re.sub(r'\s*\[chunk:[^\]]+\]', '', str(item["text"]))
                     clean_data.append(item_copy)
                 else:
                     clean_data.append(item)
@@ -11978,7 +11978,7 @@ class SectionGenerator:
             el_type = el.get("type", "paragraph")
             if el_type == "paragraph":
                 if el.get("text"):
-                    clean_text = re.sub(r'\s*\[chunk:\d+\]', '', str(el["text"]))
+                    clean_text = re.sub(r'\s*\[chunk:[^\]]+\]', '', str(el["text"]))
                     valid.append({
                         "type": "paragraph",
                         "text": clean_text,
@@ -11987,7 +11987,7 @@ class SectionGenerator:
             elif el_type == "bullet_list":
                 items = el.get("items", [])
                 if items and isinstance(items, list):
-                    clean_items = [re.sub(r'\s*\[chunk:\d+\]', '', str(i)) for i in items if i]
+                    clean_items = [re.sub(r'\s*\[chunk:[^\]]+\]', '', str(i)) for i in items if i]
                     valid.append({
                         "type": "bullet_list",
                         "items": clean_items,
@@ -11996,7 +11996,7 @@ class SectionGenerator:
             elif el_type == "numbered_list":
                 items = el.get("items", [])
                 if items and isinstance(items, list):
-                    clean_items = [re.sub(r'\s*\[chunk:\d+\]', '', str(i)) for i in items if i]
+                    clean_items = [re.sub(r'\s*\[chunk:[^\]]+\]', '', str(i)) for i in items if i]
                     valid.append({
                         "type": "numbered_list",
                         "items": clean_items,
@@ -12093,35 +12093,48 @@ class FactVerifier:
             text = el.get("text", "")
             
             # 1. Verify cited claims
-            citations = re.findall(r'\[chunk:(\d+)\]', text)
-            for ref in citations:
-                chunk_idx = int(ref) - 1  # Prompt uses 1-indexed
-                if not (0 <= chunk_idx < len(chunks)):
-                    violations.append({"claim": f"[chunk:{ref}]", "reason": "invalid index"})
-                    text = self._remove_sentence_at(text, f"[chunk:{ref}]")
-                    continue
+            citation_matches = list(re.finditer(r'\[chunk:([^\]]+)\]', text))
+            for match in citation_matches:
+                full_citation = match.group(0)
+                inner_text = match.group(1)
+                refs = re.findall(r'\d+', inner_text)
+                
+                valid_chunks_text = []
+                invalid_refs = []
+                for ref in refs:
+                    chunk_idx = int(ref) - 1
+                    if 0 <= chunk_idx < len(chunks):
+                        valid_chunks_text.append(chunks[chunk_idx].get("text", "").lower())
+                    else:
+                        invalid_refs.append(ref)
+                
+                if invalid_refs:
+                    violations.append({"claim": full_citation, "reason": "invalid index(es)", "invalid_refs": invalid_refs})
+                    if not valid_chunks_text:
+                        text = self._remove_sentence_at(text, full_citation)
+                        continue
                 
                 # ACTUAL VERIFICATION: check that numbers near this citation
-                # appear in the cited chunk
-                chunk_text = chunks[chunk_idx].get("text", "").lower()
-                sentence = self._get_sentence_containing(text, f"[chunk:{ref}]")
+                # appear in AT LEAST ONE cited chunk
+                combined_chunk_text = " ".join(valid_chunks_text).replace(",", "")
+                sentence = self._get_sentence_containing(text, full_citation)
                 numbers_in_sentence = re.findall(r'[\d,]+\.?\d*', sentence)
                 
                 for num in numbers_in_sentence:
                     clean_num = num.replace(",", "")
                     if clean_num and len(clean_num) > 1:  # Skip single digits
-                        if clean_num not in chunk_text.replace(",", ""):
+                        if clean_num not in combined_chunk_text:
                             violations.append({
                                 "claim": sentence.strip(),
                                 "value": num,
-                                "cited_chunk": ref,
-                                "reason": "number not found in cited chunk"
+                                "cited_chunk": full_citation,
+                                "reason": "number not found in cited chunks"
                             })
-                            text = self._remove_sentence_at(text, f"[chunk:{ref}]")
+                            text = self._remove_sentence_at(text, full_citation)
                             break
             
             # 2. Scan for UNCITED multi-digit numbers — backstop for claims that bypass citations
-            remaining_text = re.sub(r'\[chunk:\d+\]', '', text)
+            remaining_text = re.sub(r'\[chunk:[^\]]+\]', '', text)
             # Match any 2+ digit number not inside Table/Section/Chapter/Q references
             uncited_numbers = re.findall(r'(?<!Table\s)(?<!Section\s)(?<!Chapter\s)(?<!Q)(\d{2,}[\d,.]*)', remaining_text)
             if uncited_numbers:
@@ -12179,9 +12192,9 @@ class FactVerifier:
     def _strip_citations(self, el: dict) -> dict:
         new_el = dict(el)
         if new_el.get("type") == "paragraph":
-            new_el["text"] = re.sub(r'\s*\[chunk:\d+\]', '', new_el["text"]).strip()
+            new_el["text"] = re.sub(r'\s*\[chunk:[^\]]+\]', '', new_el["text"]).strip()
         elif new_el.get("type") in ("bullet_list", "numbered_list"):
-            new_el["items"] = [re.sub(r'\s*\[chunk:\d+\]', '', item).strip() 
+            new_el["items"] = [re.sub(r'\s*\[chunk:[^\]]+\]', '', item).strip() 
                                for item in new_el.get("items", [])]
         return new_el
 
