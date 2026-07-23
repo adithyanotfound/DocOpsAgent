@@ -107,6 +107,7 @@ class DocumentAgentGraph:
         
         # Redesigned services
         self.planner = TaskPlanner(llm=self.llm)
+        self.query_decomposer = QueryDecomposer(llm=self.llm)
         self.reference_resolver = ReferenceResolver(llm=self.llm)
         self.context_fetcher = ContextFetcher()
         self.op_generator = OperationGenerator(llm=self.llm)
@@ -434,6 +435,26 @@ class DocumentAgentGraph:
             analysis=state["analysis"],
             relevant_blocks=context_blocks
         )
+
+        # ------------------------------------------------------------------
+        # Per-task query decomposition
+        # Generates 1-3 focused KB retrieval queries per task so that later
+        # per-task retrieval can use topically precise queries rather than a
+        # single prompt-wide embedding.  Runs as a single batched LLM call.
+        # Falls back gracefully to description+target_hint on LLM failure.
+        # ------------------------------------------------------------------
+        try:
+            tasks = self.query_decomposer.decompose(
+                tasks=tasks,
+                outline=state["current_outline"],
+                user_request=state["request"],
+            )
+            total_queries = sum(len(t.get("retrieval_queries", [])) for t in tasks)
+            thought_decomp = f"Query decomposition: {total_queries} retrieval queries generated for {len(tasks)} task(s)."
+            await self._thought(state, thought_decomp)
+        except Exception as exc:
+            log.warning("Query decomposer failed: %s — skipping decomposition.", exc)
+            thought_decomp = "Query decomposition skipped (fallback to single-query retrieval)."
         
         # Route to appropriate mode based on document type and task type
         has_generate = any(t["task_type"] == "generate" for t in tasks)
@@ -516,9 +537,9 @@ class DocumentAgentGraph:
                 state["kb_context"] = []
                 kb_ctx = []
 
-        # Perform targeted per-task KB retrieval for generation and factual rewrite/table tasks.
-        # Expanding existing sections is routed as text_edit, but still needs KB grounding
-        # so the rewrite does not invent claims.
+        # Perform targeted per-task KB retrieval using pre-decomposed queries.
+        # Falls back to the original single ad-hoc query when no decomposed
+        # queries are available (e.g., decomposer was skipped or failed).
         task_type = task.get("task_type")
         task_text = f"{task.get('target_hint', '')}: {task.get('description', '')}".lower()
         factual_text_edit = (
@@ -537,22 +558,54 @@ class DocumentAgentGraph:
         )
         is_grounded_generation = task_type == "content_generation" or factual_text_edit or factual_table
 
-        if is_grounded_generation and self.kb_retrieval:
-            section_query = f"{task.get('target_hint', '')}: {task.get('description', '')}"
-            chunks, used_semantic = self.kb_retrieval.retrieve_for_section(
-                workspace_id=state["workspace_id"],
-                section_query=section_query,
-                fallback_chunks=kb_ctx,
-                limit=15,
-            )
-            if chunks:
-                task["kb_evidence"] = chunks
+        # Use decomposed queries when available; fall back to single query for
+        # grounded generation tasks that don't have them yet.
+        retrieval_queries: list[str] = task.get("retrieval_queries", [])
+        if not retrieval_queries and is_grounded_generation:
+            # Legacy fallback: build a single query from task fields
+            retrieval_queries = [
+                f"{task.get('target_hint', '')}: {task.get('description', '')}"
+            ]
+
+        if retrieval_queries and self.kb_retrieval:
+            all_chunks: list[dict] = []
+            for query in retrieval_queries:
+                try:
+                    chunks, used_semantic = self.kb_retrieval.retrieve_for_section(
+                        workspace_id=state["workspace_id"],
+                        section_query=query,
+                        fallback_chunks=kb_ctx,
+                        limit=8,  # per-query limit; deduplication applied after
+                    )
+                    all_chunks.extend(chunks)
+                    if not used_semantic:
+                        log.warning(
+                            "Task '%s': query '%s' used keyword fallback",
+                            task['description'], query[:60],
+                        )
+                except Exception as exc:
+                    log.warning(
+                        "Task '%s': KB retrieval failed for query '%s': %s",
+                        task['description'], query[:60], exc,
+                    )
+
+            # Deduplicate and rank fused results
+            if all_chunks:
+                deduped = deduplicate_chunks(all_chunks, limit=15)
+                task["kb_evidence"] = deduped
                 task["insufficient_kb_evidence"] = False
-                thought_kb = f"Retrieved {len(chunks)} KB chunk(s) for task '{task['description']}'."
+                thought_kb = (
+                    f"Retrieved {len(all_chunks)} chunk(s) across {len(retrieval_queries)} "
+                    f"query(-ies) → {len(deduped)} unique chunk(s) after dedup for "
+                    f"task '{task['description']}'"
+                )
             else:
                 task["kb_evidence"] = []
-                task["insufficient_kb_evidence"] = True
-                thought_kb = f"I couldn't find Knowledge Base content about '{task['description']}' — would you like me to write this section using general knowledge instead, or skip it?"
+                task["insufficient_kb_evidence"] = is_grounded_generation
+                thought_kb = (
+                    f"No KB content found for task '{task['description']}' "
+                    "— would you like me to write this section using general knowledge instead, or skip it?"
+                )
             await self._thought(state, thought_kb)
 
         return {
@@ -1003,6 +1056,8 @@ class DocumentAgentGraph:
             template_analysis=state["template_analysis"],
             kb_context=state["kb_context"],
             chat_history=state["chat_history"],
+            kb_retrieval=self.kb_retrieval,
+            workspace_id=state["workspace_id"],
         )
 
         n_sections = len(plan.get("sections", []))

@@ -7867,6 +7867,269 @@ class TaskPlanner:
 
 # ===== END services/task_planner.py =====
 
+# ===== BEGIN services/query_decomposer.py =====
+"""Query Decomposer — generates focused retrieval queries per task.
+
+For each task produced by TaskPlanner, this service emits 1-3 dense,
+keyword-rich search queries that can be fired at the vector store (Qdrant)
+independently.  Fetching per-task queries instead of a single prompt-wide
+query dramatically improves chunk relevance when:
+
+  * The knowledge base is large (many documents, many chunks)
+  * The user's request spans multiple unrelated topics
+  * Template sections have wildly different subject matter
+
+Design choices
+--------------
+* One batched LLM call covers ALL tasks → minimal latency overhead (~0.3 s).
+* Tasks whose type cannot benefit from KB retrieval (text_format, layout_op,
+  meta_op, section_op, style_op, slide_op, find_replace, theme_op) receive
+  empty query lists so no Qdrant calls are made for them.
+* On any failure the decomposer returns a graceful fallback: a single query
+  derived from task description + target_hint, preserving prior behaviour.
+"""
+
+import logging
+import json
+from typing import Any
+
+log = logging.getLogger(__name__)
+
+# Task types that can benefit from KB-grounded retrieval
+_RETRIEVAL_TASK_TYPES = {
+    "content_generation",
+    "text_edit",
+    "table_op",
+    "docx_generate",
+    "generate",
+    "image_op",   # may need factual captions from KB
+    "list_op",    # may add factual bullet items
+}
+
+# Task types that need no KB retrieval at all
+_NO_RETRIEVAL_TASK_TYPES = {
+    "text_format",
+    "layout_op",
+    "meta_op",
+    "section_op",
+    "style_op",
+    "slide_op",
+    "find_replace",
+    "theme_op",
+}
+
+_DECOMPOSER_SYSTEM_PROMPT = """\
+You are a search query optimizer for a document knowledge-base retrieval system.
+
+Given a list of document-editing tasks, generate focused, keyword-dense retrieval
+queries for each task that needs Knowledge Base content.
+
+RULES:
+1. Return ONLY keyword-rich queries (NOT natural-language questions).
+   BAD:  "What are the ESG metrics for Q3?"
+   GOOD: "ESG environmental social governance metrics Q3 performance targets"
+2. Generate 1 to 3 queries per task. Use multiple queries to cover different
+   sub-topics or synonymous phrasings of the same topic.
+3. For tasks that do NOT need KB content (formatting, layout, style changes),
+   return an empty list [].
+4. Keep each query under 15 words.
+5. Focus on the CONTENT TOPIC, not the editing action.
+   BAD:  "add sustainability section to document"
+   GOOD: "sustainability renewable energy carbon footprint emissions targets"
+6. If the task_type is text_edit AND the description mentions expanding/rewriting
+   an existing section, generate queries for the SUBJECT MATTER of that section.
+
+Return ONLY a JSON object:
+{
+  "task_queries": [
+    {"task_index": 0, "queries": ["query 1", "query 2"]},
+    {"task_index": 1, "queries": []},
+    ...
+  ]
+}
+"""
+
+
+class QueryDecomposer:
+    """Generates focused KB retrieval queries for each task in a task list.
+
+    Usage::
+
+        decomposer = QueryDecomposer(llm=llm_client)
+        tasks_with_queries = decomposer.decompose(tasks, outline, user_request)
+        # Each task dict now has a 'retrieval_queries' key.
+    """
+
+    def __init__(self, llm: "LLMClient | None" = None) -> None:
+        self._llm = llm
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def decompose(
+        self,
+        tasks: list[dict],
+        outline: dict,
+        user_request: str,
+    ) -> list[dict]:
+        """Attach ``retrieval_queries`` to each task and return the updated list.
+
+        On LLM failure, falls back to a single query per task derived from
+        task description + target_hint (identical to the current behaviour).
+        """
+        if not tasks:
+            return tasks
+
+        # Identify which tasks actually need retrieval
+        tasks_needing_retrieval = [
+            (i, t) for i, t in enumerate(tasks)
+            if t.get("task_type") in _RETRIEVAL_TASK_TYPES
+        ]
+
+        if not tasks_needing_retrieval:
+            # Nothing needs retrieval — tag all tasks with empty queries and return
+            for t in tasks:
+                t.setdefault("retrieval_queries", [])
+            return tasks
+
+        try:
+            query_map = self._call_llm(tasks_needing_retrieval, outline, user_request)
+        except Exception as exc:
+            log.warning("QueryDecomposer: LLM call failed (%s). Using fallback queries.", exc)
+            query_map = {}
+
+        result = list(tasks)
+        for i, task in enumerate(result):
+            if i in query_map:
+                task = dict(task)
+                task["retrieval_queries"] = query_map[i]
+            elif task.get("task_type") in _RETRIEVAL_TASK_TYPES:
+                # Fallback: single query from description + target_hint
+                task = dict(task)
+                task["retrieval_queries"] = self._fallback_query(task)
+            else:
+                task = dict(task)
+                task["retrieval_queries"] = []
+            result[i] = task
+
+        return result
+
+    # ------------------------------------------------------------------
+    # Private helpers
+    # ------------------------------------------------------------------
+
+    def _call_llm(
+        self,
+        tasks_needing_retrieval: list[tuple[int, dict]],
+        outline: dict,
+        user_request: str,
+    ) -> dict[int, list[str]]:
+        """Batch LLM call to generate queries for all retrieval-eligible tasks."""
+        llm = self._llm or LLMClient()
+
+        # Build a compact task list for the prompt
+        task_descriptions = []
+        for idx, task in tasks_needing_retrieval:
+            task_descriptions.append({
+                "task_index": idx,
+                "task_type": task.get("task_type", ""),
+                "description": task.get("description", "")[:200],
+                "target_hint": task.get("target_hint", "")[:100],
+            })
+
+        # Include document outline section names for context
+        section_names = [
+            s.get("heading", "") for s in outline.get("sections", [])
+            if s.get("heading")
+        ][:15]
+
+        user_prompt = (
+            f"User request: {user_request[:300]}\n\n"
+            f"Document sections: {', '.join(section_names)}\n\n"
+            f"Tasks requiring KB queries:\n{json.dumps(task_descriptions, indent=2)}\n\n"
+            "Generate retrieval queries for each task."
+        )
+
+        response = llm.complete(LLMRequest(
+            system_prompt=_DECOMPOSER_SYSTEM_PROMPT,
+            user_prompt=user_prompt,
+            temperature=0.0,
+            max_tokens=512,
+            json_mode=True,
+        ))
+
+        parsed = response.json or {}
+        query_map: dict[int, list[str]] = {}
+        for entry in parsed.get("task_queries", []):
+            idx = entry.get("task_index")
+            queries = entry.get("queries", [])
+            if isinstance(idx, int) and isinstance(queries, list):
+                # Sanitize: keep only non-empty strings, cap at 3
+                clean = [q.strip() for q in queries if isinstance(q, str) and q.strip()][:3]
+                query_map[idx] = clean
+
+        # Log summary
+        total_queries = sum(len(v) for v in query_map.values())
+        log.info(
+            "QueryDecomposer: %d tasks → %d retrieval queries generated",
+            len(tasks_needing_retrieval), total_queries,
+        )
+        return query_map
+
+    def _fallback_query(self, task: dict) -> list[str]:
+        """Single fallback query: description + target_hint concatenated."""
+        parts = [task.get("description", ""), task.get("target_hint", "")]
+        q = " ".join(p for p in parts if p).strip()
+        return [q] if q else []
+
+
+# ---------------------------------------------------------------------------
+# Chunk deduplication utility
+# ---------------------------------------------------------------------------
+
+def deduplicate_chunks(chunks: list[dict], limit: int = 15) -> list[dict]:
+    """Deduplicate KB chunks from multiple retrieval queries.
+
+    Merges chunks by (doc_id, chunk_index) identity, keeping the instance
+    with the highest relevance score.  Falls back to text-hash identity when
+    metadata is missing.  Returns at most ``limit`` chunks ranked by score.
+
+    Args:
+        chunks: Flat list of chunk dicts (may contain duplicates from
+                multiple Qdrant queries).  Each dict should have:
+                  - ``metadata.doc_id``
+                  - ``chunk_index``
+                  - ``score``  (optional, used for ranking)
+        limit:  Maximum number of chunks to return.
+
+    Returns:
+        Deduplicated, score-ranked list of up to ``limit`` chunk dicts.
+    """
+    seen: dict[tuple, dict] = {}
+
+    for chunk in chunks:
+        meta = chunk.get("metadata", {})
+        doc_id = meta.get("doc_id") or meta.get("document_id") or ""
+        chunk_idx = chunk.get("chunk_index", "")
+        # Fallback identity key: first 64 chars of text
+        text_key = (chunk.get("text", "") or "")[:64]
+
+        key = (doc_id, chunk_idx) if (doc_id and chunk_idx != "") else ("__text__", text_key)
+
+        existing = seen.get(key)
+        if existing is None:
+            seen[key] = chunk
+        else:
+            # Keep whichever has the higher relevance score
+            if chunk.get("score", 0.0) > existing.get("score", 0.0):
+                seen[key] = chunk
+
+    ranked = sorted(seen.values(), key=lambda c: c.get("score", 0.0), reverse=True)
+    return ranked[:limit]
+
+# ===== END services/query_decomposer.py =====
+
 # ===== BEGIN services/outline_builder.py =====
 """Document Outline Builder — builds a hierarchical semantic outline of a document.
 
@@ -11536,6 +11799,8 @@ class DocumentPlanner:
         template_analysis: dict,
         kb_context: list[dict],
         chat_history: list[dict] | None = None,
+        kb_retrieval: Any | None = None,
+        workspace_id: str | None = None,
     ) -> dict:
         """Produce a comprehensive document plan.
 
@@ -11544,13 +11809,36 @@ class DocumentPlanner:
             template_analysis: Output of TemplateAnalyzer.analyze().
             kb_context: Retrieved KB chunks (may be empty if no KB).
             chat_history: Recent conversation for context.
+            kb_retrieval: Optional KBRetrievalService for per-section semantic
+                retrieval.  When provided, each template section gets its own
+                focused Qdrant query instead of a global flat-context view.
+            workspace_id: Required when kb_retrieval is provided.
         """
         llm = self._llm or LLMClient()
 
-        # Build context strings
+        # ------------------------------------------------------------------
+        # Per-section pre-retrieval (when Qdrant is available)
+        # Retrieves 8-10 highly relevant chunks per section heading so the
+        # planning LLM sees targeted context instead of a truncated global dump.
+        # ------------------------------------------------------------------
         sections_summary = self._format_template_sections(template_analysis)
-        kb_summary = self._format_kb_context(kb_context)
         history_str = self._format_history(chat_history)
+
+        if kb_retrieval and workspace_id and kb_context:
+            section_chunks = self._retrieve_per_section(
+                template_analysis=template_analysis,
+                user_request=user_request,
+                kb_retrieval=kb_retrieval,
+                workspace_id=workspace_id,
+                fallback_chunks=kb_context,
+            )
+            kb_summary = self._format_per_section_kb(section_chunks)
+            log.info(
+                "DocumentPlanner: using per-section KB context (%d sections)",
+                len(section_chunks),
+            )
+        else:
+            kb_summary = self._format_kb_context(kb_context)
 
         user_prompt = (
             f"{history_str}"
@@ -11598,6 +11886,70 @@ class DocumentPlanner:
                 sub_indent = "  " * (sub.get("heading_level", 2) - 1)
                 lines.append(f"{sub_indent}  - [{sub['style_name']}] {sub['heading_text']}")
 
+        return "\n".join(lines)
+
+    def _retrieve_per_section(
+        self,
+        template_analysis: dict,
+        user_request: str,
+        kb_retrieval: Any,
+        workspace_id: str,
+        fallback_chunks: list[dict],
+        limit_per_section: int = 8,
+    ) -> dict[str, list[dict]]:
+        """Run a focused Qdrant query for each template section heading.
+
+        Returns a dict mapping section heading → list of retrieved chunks.
+        Falls back gracefully to an empty list per section on error.
+        """
+        sections = template_analysis.get("sections", [])
+        section_chunks: dict[str, list[dict]] = {}
+
+        for section in sections:
+            heading = section.get("heading_text", "")
+            if not heading:
+                continue
+            # Combine heading with user request for better query specificity
+            section_query = f"{heading}: {user_request[:200]}"
+            try:
+                chunks, _ = kb_retrieval.retrieve_for_section(
+                    workspace_id=workspace_id,
+                    section_query=section_query,
+                    fallback_chunks=fallback_chunks,
+                    limit=limit_per_section,
+                )
+                section_chunks[heading] = chunks
+            except Exception as exc:
+                log.warning(
+                    "DocumentPlanner: per-section retrieval failed for '%s': %s",
+                    heading, exc,
+                )
+                section_chunks[heading] = []
+
+        return section_chunks
+
+    def _format_per_section_kb(self, section_chunks: dict[str, list[dict]]) -> str:
+        """Format per-section retrieved chunks into an LLM-readable context block.
+
+        Each section gets its own clearly delimited block so the planning LLM
+        can easily associate chunks to their most relevant section.
+        """
+        if not section_chunks:
+            return "(No knowledge base documents uploaded)"
+
+        lines: list[str] = []
+        for heading, chunks in section_chunks.items():
+            lines.append(f"\n── {heading} ──")
+            if not chunks:
+                lines.append("  (no relevant KB content found for this section)")
+                continue
+            for i, chunk in enumerate(chunks[:8]):
+                meta = chunk.get("metadata", {})
+                source = meta.get("source", "Unknown")
+                page = meta.get("page", "")
+                loc = f"[{source}" + (f", p.{page}" if page else "") + "]"
+                preview = chunk.get("text", "")[:400].replace("\n", " ")
+                lines.append(f"  [Chunk {i}] {loc} {preview}")
         return "\n".join(lines)
 
     def _format_kb_context(self, chunks: list[dict]) -> str:
