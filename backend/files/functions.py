@@ -7615,8 +7615,8 @@ Available task types:
 - section_op: Modify document section properties (Margins, orientation, page size)
 - style_op: Modify built-in global DOCX styles (Heading 1, Normal, etc.)
 - slide_op: Add, delete, duplicate, hide, or reorder slides (for presentations only)
-- generate: Create full slide presentation content from scratch (for presentations only)
-- docx_generate: Generate a comprehensive, full document from scratch using the DOCX template structure and the workspace knowledge base. Use this ONLY for DOCX documents when the user asks to "create", "generate", "write", "draft", "produce", or "build" a full document or major new sections (e.g., "create a financial report", "generate meeting minutes", "write a Q3 summary report"). Do NOT use for targeted edits to existing content.
+- generate: Create full slide presentation content from scratch (for presentations only). CRITICAL: Use this even if there is an existing outline or chat history if the user explicitly asks to generate a full presentation/deck.
+- docx_generate: Generate a comprehensive, full document from scratch using the DOCX template structure and the workspace knowledge base. Use this ONLY for DOCX documents when the user asks to "create", "generate", "write", "draft", "produce", or "build" a full document or major new sections (e.g., "create a financial report", "generate meeting minutes", "write a Q3 summary report"). Do NOT use for targeted edits to existing content. CRITICAL: Use this even if there is an existing outline or chat history if the user explicitly asks to generate a full document.
 - content_generation: Generate new substantive section/paragraph content grounded in workspace Knowledge Base evidence. Use this for requests that add new factual sections, topics, or multi-paragraph content (e.g., "add a sustainability section", "write an ESG summary", "add a section on Q2 financial metrics", "add an environmental impact section"). Do NOT use for simple text rewrites, expanding/shortening an existing section, or formatting changes.
 
 For each task, provide:
@@ -7634,7 +7634,7 @@ CRITICAL RULES:
 5. DO NOT create image_op tasks (like adding or replacing images/logos) unless the user EXPLICITLY asks you to add, replace, or modify an image. Do not invent image tasks to "improve" the document.
 6. FONT & STYLING INTENT: If the user says "change font to X", "make text Arial", or "use Helvetica", this is ALWAYS a `text_format` task (changing the font family). Do NOT use `text_edit` for these requests!
 6A. SELECTIVE IMPORTANCE HIGHLIGHTING: If the user asks to "highlight important content" or "highlight key/critical content", emit a `text_format` task with target_hint "important content". NEVER use target_hint "all" or "all paragraphs" unless the user explicitly says to highlight everything.
-7. DOCX GENERATION INTENT: If the user asks to "create", "generate", "write", "draft", or "produce" a complete document, report, or major new content (e.g., "create a Q3 financial report", "generate minutes of meeting", "write a compliance report"), and the document type is DOCX, use a single `docx_generate` task. The target_hint should describe the type of document to generate.
+7. DOCX GENERATION INTENT: If the user asks to "create", "generate", "write", "draft", or "produce" a complete document, report, or major new content (e.g., "create a Q3 financial report", "generate minutes of meeting", "write a compliance report"), and the document type is DOCX, use a single `docx_generate` task. The target_hint should describe the type of document to generate. CRITICAL: You MUST use `docx_generate` (or `generate` for PPTX) for these requests even if there is chat history or an existing document outline! Do not fall back to `content_generation` just because it is not the first prompt.
 8. KNOW YOUR LIMITATIONS: The document engine natively supports:
    - Text: bold, italic, underline, strikethrough, highlight_color, font name, font size (pt), and font color (RGB hex).
    - Paragraphs: left/center/right/justify align, space before/after (pt), line spacing (e.g., 1.5), page breaks, left/right/first-line indents (pt), and keep with next / keep together.
@@ -7841,6 +7841,28 @@ class TaskPlanner:
                     "target_hint": task.get("target_hint") or "all",
                     "dependencies": [d for d in task.get("dependencies", []) if isinstance(d, int)],
                 })
+        
+        # Check for full document generation intent if the LLM missed it due to chat history
+        if not any(t.get("task_type") in ("generate", "docx_generate") for t in validated):
+            if (
+                any(w in request_l for w in ("generate ", "create ", "draft ", "write ", "build ", "produce "))
+                and any(w in request_l for w in (" report", " deck", " presentation", " document", " minutes"))
+                and " section" not in request_l
+                and " paragraph" not in request_l
+                and " slide" not in request_l
+                and " page" not in request_l
+                and " table" not in request_l
+            ):
+                is_docx = outline.get("document_type") == "docx"
+                return [
+                    {
+                        "task_type": "docx_generate" if is_docx else "generate",
+                        "description": f"Generate full document/presentation for: {request}",
+                        "target_hint": "entire document",
+                        "dependencies": [],
+                    }
+                ]
+
         return validated
 
 # ===== END services/task_planner.py =====
